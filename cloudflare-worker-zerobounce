@@ -1,0 +1,393 @@
+/**
+ * Worker Name:       ZeroBounce Email Validator
+ * Worker URI:        tbc
+ * Description:       Cloudflare ZeroBounce Email Validation Worker
+ * Version:           1.0.0
+ * Author:            ZeroBounce
+ * Author URI:        https://www.zerobounce.net/
+ * License:           GPL-2.0+
+ * License URI:       http://www.gnu.org/licenses/gpl-2.0.txt
+ */
+ 
+/**
+ * Community based email Regex heavily modified to our needs
+ * DO NOT EDIT!
+ * ------------
+ - allows Latin characters ("a" - "z" or "A" - "Z") within the email 
+address.
+ - permits digits (0 - 9) in the email address.
+ - enforces domain part restrictions.
+ - allows hyphens (-) inside the domain as long as they don't lead or 
+trail the domain.
+ - allows IP address literals surrounded with square brackets ([]) for the 
+domain names.
+ - restricts sub-domains to a maximum length of 63 characters.
+ - applies local part restrictions.
+ - permits the set of special characters allowed by RFC 5322 ("!", "#", 
+"$", "%", "&", "'", "*", "+", "-", "/", "=", "?", "^", "_", "`", "{", "|", 
+"}", "~”) to reside in the local part.
+ - lets local part comprise as double quotes housing one or more sequences 
+of ASCII characters.
+ - doesn't allow trailing, leading, or consecutive periods anywhere within 
+the email address.
+ - doesn't allow Unicode characters.
+ - doesn't check for the entire length of the email address to be less 
+than or equal to 253 characters.
+ - ignores obsolete syntax-related rules.
+ */
+const regex1 = 
+'(\\"\\s+|[\\\\r\\\\n]+)(([-!#-\'*+\\/-9=?A-Z^-~]+(\\.[-!#-\'*+\\/-9=?A-Z^-~]+)*|"([]!#-[^-~ 
+\\t]|(\\\\[\\t 
+-~]))+")@([0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?(\\.[0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?)*|\\[((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|IPv6:((((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){6}|::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){5}|[0-9A-Fa-f]{0,4}::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){4}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):)?(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){3}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,2}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){2}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,3}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,4}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,5}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,6}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)|(?!IPv6:)[0-9A-Za-z-]*[0-9A-Za-z]:[!-Z^-~]+)]))';
+const regexBodyBuffer = new RegExp(`${regex1}`, '');
+ 
+/**
+ * Similar to the above.
+ * DO NOT EDIT!
+ * ------------
+ */
+const regex2 = 
+'(.*=)(([-!#-\'*+\\/-9=?A-Z^-~]+(\\.[-!#-\'*+\\/-9=?A-Z^-~]+)*|"([]!#-[^-~ 
+\\t]|(\\\\[\\t 
+-~]))+")@([0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?(\\.[0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?)*|\\[((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|IPv6:((((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){6}|::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){5}|[0-9A-Fa-f]{0,4}::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){4}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):)?(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){3}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,2}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){2}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,3}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,4}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,5}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,6}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)|(?!IPv6:)[0-9A-Za-z-]*[0-9A-Za-z]:[!-Z^-~]+)]))&';
+const regexFormBuffer = new RegExp(`${regex2}`, '');
+ 
+/**
+ * Similar to the above.
+ * DO NOT EDIT!
+ * ------------
+ */
+const regex3 = 
+'(\\\\\\"([-!#-\'*+\\/-9=?A-Z^-~]+(\\.[-!#-\'*+\\/-9=?A-Z^-~]+)*|"([]!#-[^-~ 
+\\t]|(\\\\[\\t 
+-~]))+")@([0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?(\\.[0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?)*|\\[((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|IPv6:((((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){6}|::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){5}|[0-9A-Fa-f]{0,4}::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){4}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):)?(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){3}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,2}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){2}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,3}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,4}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,5}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,6}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)|(?!IPv6:)[0-9A-Za-z-]*[0-9A-Za-z]:[!-Z^-~]+)])\\\\\\")';
+const regexJsonBuffer = new RegExp(`${regex3}`, '');
+ 
+/**
+ * The TextEncoder takes a stream of code points as input and emits a 
+stream of bytes. 
+ * Encoding types passed to the constructor are ignored and a UTF-8 
+TextEncoder is created.
+ * Encodes a string input.
+ */
+function textToBuffer(text) {
+    const encoder = new TextEncoder();
+    return encoder.encode(text);
+}
+ 
+/**
+ * The TextDecoder interface represents a UTF-8 decoder. 
+ * Decoders take a stream of bytes as input and emit a stream of code 
+points.
+ * Decodes using the method specified in the TextDecoder object.
+ */
+function bufferToText(buffer) {
+    const decoder = new TextDecoder();
+    return decoder.decode(buffer);
+}
+ 
+/**
+ * Logs validations into the Worker KV Namespace
+ */
+function logValidation(event, email, url, result) {
+    if (typeof LOGS !== 'undefined') {
+        const pad = (n, s = 2) => (`${new 
+Array(s).fill(0)}${n}`).slice(-s);
+        const d = new Date();
+ 
+        // The waitUntil function allows us to continue performing work in 
+our Cloudflare Worker, without blocking.
+        
+event.waitUntil(LOGS.put(`{${pad(d.getFullYear(),4)}-${pad(d.getMonth()+1)}-${pad(d.getDate())}}-{${email}}-{${url}}-{${pad(d.getHours())}:${pad(d.getMinutes())}}-${pad(d.getSeconds())}.${pad(d.getMilliseconds(),3)}`,
+            JSON.stringify(result)));
+    }
+}
+ 
+/**
+ * Validates an email using the ZeroBounce real-time email validation API
+ * The fetch request can be aborted automatically using a timeout.
+ * The function is async however it waits itself for the response.
+ */
+async function validateEmail(email, ip_address) {
+    if (typeof API_KEY !== 'undefined') {
+        const url = new URL("https://api.zerobounce.net/v2/validate");
+ 
+        url.searchParams.set("api_key", API_KEY);
+        url.searchParams.set("email", email);
+        url.searchParams.set("ip_address", ip_address);
+ 
+        try {
+            const resp = await fetch(url, {
+                signal: AbortSignal.timeout(API_TIMEOUT),
+                headers: {
+                    'User-Agent': 'ZeroBounce Email Validator (Cloudflare 
+Worker)'
+                }
+            });
+ 
+            const data = await resp.json();
+ 
+            return data;
+        } catch (err) {
+            // A network error, or some other problem.
+            return `{ "error": "${err.name}", "message": 
+"${err.message}}"`;
+        }
+    }
+}
+ 
+/**
+ * The handler function for the event listener.
+ */
+async function handleRequest(event) {
+    // An error here will return the origin response, as if the Worker 
+wasn’t present.
+    const request = event.request;
+ 
+    if (request.method === 'POST') {
+        console.log(`Incoming correct request: ${request.method}`);
+ 
+        const {
+            headers
+        } = request;
+        const contentType = headers.get('content-type');
+        const {
+            pathname
+        } = new URL(request.url);
+        const clientIP = headers.get('CF-Connecting-IP');
+ 
+        if (typeof BYPASS_PATH !== 'undefined') {
+            if (BYPASS_PATH.includes(pathname)) {
+                console.log(`BYPASS_PATH set for: ${pathname}. Returning 
+original request.`);
+                return await fetch(request);
+            }
+        }
+ 
+        if (contentType) {
+            console.log(`Incoming content type: ${contentType}`);
+ 
+            if (contentType.includes('multipart/form-data')) {
+                const _body = await request.clone().arrayBuffer();
+ 
+                let _body_text = bufferToText(_body);
+ 
+                let m;
+                if ((m = regexBodyBuffer.exec(_body_text)) !== null) {
+                    const email = m[2];
+                    console.log(`Matched email: ${email}`);
+ 
+                    let validate = await validateEmail(email, clientIP);
+ 
+                    await logValidation(event, email, pathname, validate);
+ 
+                    if (validate.hasOwnProperty('status')) {
+                        console.log(`Email validation status: 
+${validate.status}`);
+ 
+                        if (typeof VALID_STATUS !== 'undefined' && 
+!VALID_STATUS.includes(validate.status)) {
+                            _body_text = 
+_body_text.replace(regexBodyBuffer, `$1INVALID`);
+                        }
+                    }
+ 
+                    const _body_buffer = textToBuffer(_body_text);
+ 
+                    const newRequestInit = {
+                        // Change body
+                        body: _body_buffer,
+                    };
+ 
+                    const newRequest = new Request(
+                        request.url.toString(),
+                        new Request(request, newRequestInit)
+                    );
+ 
+                    console.log(`Returning modified request.`);
+ 
+                    return await fetch(newRequest);
+                } else {
+                    console.log(`Unable to find an email match in body: 
+${_body_text}`);
+                }
+ 
+                // Return original request untouched
+                return await fetch(request);
+            } else if (contentType === 
+'application/x-www-form-urlencoded') {
+                // Method 1:
+                // Try and extract the email from "normal inputs"
+                // 
+==========================================================
+                let _form = await request.clone().formData();
+ 
+                const email = _form.get('email') || 
+_form.get('your-email');
+ 
+                if (email) {
+                    console.log(`Found email input: ${email}`);
+ 
+                    let validate = await validateEmail(email, clientIP);
+ 
+                    await logValidation(event, email, pathname, validate);
+ 
+                    if (validate.hasOwnProperty('status')) {
+                        console.log(`Email validation status: 
+${validate.status}`);
+ 
+                        if (typeof VALID_STATUS !== 'undefined' && 
+!VALID_STATUS.includes(validate.status)) {
+                            _form.set('email', `INVALID`);
+ 
+                            const newRequestInit = {
+                                body: _form,
+                            };
+ 
+                            const newRequest = new Request(
+                                request.url.toString(),
+                                new Request(request, newRequestInit)
+                            );
+ 
+                            console.log(`Returning modified request.`);
+ 
+                            return await fetch(newRequest);
+                        }
+                    }
+                }
+                // Method 2:
+                // Try and extract the email from the parsed body itself
+                // This applies when the email input is not named 
+accordignly (email)
+                // 
+==========================================================
+                else {
+                    console.log(`Unable to find email input: ${email}`);
+ 
+                    // Clone the request data as buffer
+                    const _body = await request.clone().arrayBuffer();
+ 
+                    let _body_text = 
+decodeURIComponent(bufferToText(_body));
+ 
+                    // Find the email
+                    let m;
+                    if ((m = regexFormBuffer.exec(_body_text)) !== null) {
+                        const email = m[2];
+                        console.log(`Matched email: ${email}`);
+ 
+                        let validate = await validateEmail(email, 
+clientIP);
+ 
+                        await logValidation(event, email, pathname, 
+validate);
+ 
+                        if (validate.hasOwnProperty('status')) {
+                            console.log(`Email validation status: 
+${validate.status}`);
+ 
+                            if (typeof VALID_STATUS !== 'undefined' && 
+!VALID_STATUS.includes(validate.status)) {
+                                _body_text = 
+_body_text.replace(regexFormBuffer, `$1INVALID`);
+                            }
+                        }
+ 
+                        const _body_buffer = textToBuffer(_body_text);
+ 
+                        const newRequestInit = {
+                            body: _body_buffer,
+                        };
+ 
+                        const newRequest = new Request(
+                            request.url.toString(),
+                            new Request(request, newRequestInit)
+                        );
+ 
+                        console.log(`Returning modified request.`);
+ 
+                        return await fetch(newRequest);
+                    } else {
+                        console.log(`Unable to find an email match in 
+body: ${_body_text}`);
+                    }
+                }
+ 
+                // Return original request untouched
+                console.log(`Returning original request, nothing done.`);
+                return await fetch(request);
+            }
+            // Experimental
+            else if (contentType.includes('application/json')) {
+                const _body = await request.clone().json();
+ 
+                if (_body.hasOwnProperty('form')) {
+                    let _form = JSON.parse(_body.form);
+ 
+                    const email_key = Object.keys(_form).filter(k => 
+k.startsWith('email'));
+ 
+                    if (email_key) {
+                        const email = _form[email_key];
+ 
+                        if (email) {
+                            console.log(`Matched email: ${email}`);
+ 
+                            let validate = await validateEmail(email, 
+clientIP);
+ 
+                            await logValidation(event, email, pathname, 
+validate);
+ 
+                            if (validate.hasOwnProperty('status')) {
+                                console.log(`Email validation status: 
+${validate.status}`);
+ 
+                                if (typeof VALID_STATUS !== 'undefined' && 
+!VALID_STATUS.includes(validate.status)) {
+                                    _form[email_key] = "INVALID";
+ 
+                                    _body.form = JSON.stringify(_form);
+ 
+                                    const newRequestInit = {
+                                        // Change body
+                                        body: JSON.stringify(_body),
+                                    };
+ 
+                                    const newRequest = new Request(
+                                        request.url.toString(),
+                                        new Request(request, 
+newRequestInit)
+                                    );
+ 
+                                    console.log(`Returning modified 
+request.`);
+ 
+                                    return await fetch(newRequest);
+                                }
+                            }
+                        }
+                    } else {
+                        console.log(`Unable to find an email match in 
+json: ${_body}`);
+                    }
+                }
+ 
+                // Return original request untouched
+                return await fetch(request);
+            }
+        }
+    }
+ 
+    return await fetch(request);
+}
+ 
+addEventListener("fetch", (event) => {
+    // By using event.passThroughOnException, a Workers application will 
+forward requests to your origin if an exception is thrown during the 
+Worker’s execution. 
+    // This allows you to add logging, tracking, or other features with 
+Workers, without degrading your application’s functionality.
+    event.passThroughOnException();
+    event.respondWith(handleRequest(event));
+});
