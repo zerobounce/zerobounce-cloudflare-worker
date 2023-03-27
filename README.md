@@ -6,19 +6,4 @@ The ZeroBounce email validator now officially integrates with Cloudflare Workers
 ## How Cloudflare Worker’s email validation middleware works
 The Cloudflare worker intercepts any incoming POST requests on the route where it’s deployed. In other words, it examines any email address entered into your website form, validates it, and rejects or accepts the address based on the results.
 
-The integration currently allows for
-
-✓ AJAX email validation
-
-✓ XMLHttpRequest
-
-Note - JSON email validation is not yet supported and may arrive in a future update.
-
-
-You can easily set up your email validation middleware by
-
-1. Creating Cloudflare Workers KV storage for your validation logs
-2. Creating the worker
-3. Establishing variables for your ZeroBounce API key, timeout rules, and email validation status
-4. Add a binding to store your logs
-5. Set up the route for your Cloudflare worker
+Please find here the ZeroBounce Cloudflare worker script: https://github.com/zerobounce/zerobounce-cloudflare-worker/blob/main/cloudflare-worker-zerobounce
