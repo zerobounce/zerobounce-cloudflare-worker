@@ -75,5 +75,5 @@ Changing these would alter live behaviour, so they are documented rather than fi
   branch is unreachable, and `_form[email_key]` only works while exactly one key starts with `email`.
 - The `[\\r\\n]+` alternative in the first regex matches the literal characters `\`, `r`, `n` rather than a newline.
   The `\"\s+` alternative is what actually matches multipart bodies.
-- The file header still says `License: GPL-2.0+` while the repository ships an MIT `LICENSE`. Relicensing is a
-  maintainer decision, not an agent one.
+- The Worker is MIT, stated both in the file header and in `LICENSE`, matching the 13 SDK repositories.
+  The header previously said `GPL-2.0+`; that was reconciled to MIT by the maintainer, not assumed.
