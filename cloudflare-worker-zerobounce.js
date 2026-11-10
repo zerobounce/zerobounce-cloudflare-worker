@@ -81,13 +81,66 @@ function logValidation(event, email, url, result) {
 }
 
 /**
+ * ZeroBounce serves the real-time validation API from three interchangeable
+ * hosts: `api` is the global entry point, while `api-us` and `api-eu` pin
+ * traffic to a single region, which some deployments need for data residency.
+ *
+ * The region is selected with the optional `API_REGION` environment binding
+ * (Workers -> Settings -> Variables and Secrets). When the binding is absent
+ * or empty the Worker keeps calling the global host, so Workers deployed
+ * before this setting existed behave exactly as they did before.
+ *
+ *   API_REGION unset / "global"  ->  https://api.zerobounce.net/v2/validate
+ *   API_REGION = "us"            ->  https://api-us.zerobounce.net/v2/validate
+ *   API_REGION = "eu"            ->  https://api-eu.zerobounce.net/v2/validate
+ *
+ * ZeroBounce documents no regional bulk or warm-up host, so this applies to
+ * the single-email /validate endpoint only.
+ */
+const DEFAULT_VALIDATE_URL = 'https://api.zerobounce.net/v2/validate';
+const US_VALIDATE_URL = 'https://api-us.zerobounce.net/v2/validate';
+const EU_VALIDATE_URL = 'https://api-eu.zerobounce.net/v2/validate';
+
+const VALIDATE_URL_BY_REGION = {
+    '': DEFAULT_VALIDATE_URL,
+    'global': DEFAULT_VALIDATE_URL,
+    'default': DEFAULT_VALIDATE_URL,
+    'us': US_VALIDATE_URL,
+    'usa': US_VALIDATE_URL,
+    'eu': EU_VALIDATE_URL
+};
+
+/**
+ * Resolves the validation endpoint from the optional API_REGION binding.
+ * The value is matched against a fixed allow-list (with hasOwnProperty, so
+ * inherited names such as "constructor" are not treated as regions): an
+ * unrecognised region falls back to the global host rather than sending the
+ * API key to somewhere unintended.
+ */
+function validationEndpoint() {
+    if (typeof API_REGION === 'undefined' || API_REGION === null) {
+        return DEFAULT_VALIDATE_URL;
+    }
+
+    const region = String(API_REGION).trim().toLowerCase();
+
+    if (Object.prototype.hasOwnProperty.call(VALIDATE_URL_BY_REGION, region)) {
+        return VALIDATE_URL_BY_REGION[region];
+    }
+
+    console.log(`Unknown API_REGION: ${API_REGION}. Falling back to ${DEFAULT_VALIDATE_URL}.`);
+
+    return DEFAULT_VALIDATE_URL;
+}
+
+/**
  * Validates an email using the ZeroBounce real-time email validation API
  * The fetch request can be aborted automatically using a timeout.
  * The function is async however it waits itself for the response.
  */
 async function validateEmail(email, ip_address) {
     if (typeof API_KEY !== 'undefined') {
-        const url = new URL("https://api.zerobounce.net/v2/validate");
+        const url = new URL(validationEndpoint());
 
         url.searchParams.set("api_key", API_KEY);
         url.searchParams.set("email", email);
@@ -106,7 +159,7 @@ async function validateEmail(email, ip_address) {
             return data;
         } catch (err) {
             // A network error, or some other problem.
-            return `{ "error": "${err.name}", "message": "${err.message}}"`;
+            return `{ "error": "${err.name}", "message": "${err.message}" }`;
         }
     }
 }
@@ -205,7 +258,14 @@ async function handleRequest(event) {
                             _form.set('email', `INVALID`);
 
                             const newRequestInit = {
-                                body: _form,
+                                // The incoming Content-Type header is carried
+                                // over to the new request, so the body has to
+                                // stay URL-encoded. Passing the FormData
+                                // object straight through produces a
+                                // multipart body that is still labelled
+                                // application/x-www-form-urlencoded, which the
+                                // origin cannot parse.
+                                body: new URLSearchParams([..._form]).toString(),
                             };
 
                             const newRequest = new Request(
