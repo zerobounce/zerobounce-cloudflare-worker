@@ -1,0 +1,18 @@
+{
+  "name": "zerobounce-cloudflare-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that validates email addresses in form submissions with the ZeroBounce API",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zerobounce/zerobounce-cloudflare-worker.git"
+  },
+  "scripts": {
+    "lint": "node --check cloudflare-worker-zerobounce.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
