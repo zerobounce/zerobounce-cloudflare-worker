@@ -1,0 +1,23 @@
+# Env & secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+.wrangler/
+
+# Dependencies & build output
+node_modules/
+dist/
+coverage/
+
+# Logs & debug
+npm-debug.log*
+yarn-debug.log*
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
