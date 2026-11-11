@@ -10,7 +10,7 @@ By participating in this project, you agree to uphold our [Code of Conduct](CODE
 
 See the [README](README.md) for what the Worker does, the environment bindings it reads, and how to run the test suite.
 
-You need Node.js 20 or newer. There are no dependencies to install:
+You need Node.js 22 or newer. There are no dependencies to install:
 
 ```bash
 npm run lint   # node --check on the Worker source
