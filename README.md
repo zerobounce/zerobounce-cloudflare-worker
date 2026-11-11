@@ -29,10 +29,20 @@ binding is optional: when one is missing the Worker falls back to forwarding the
 | --- | --- | --- | --- |
 | `API_KEY` | Secret | — | Your ZeroBounce API key. Without it the Worker validates nothing. |
 | `API_REGION` | Variable | `global` | Which ZeroBounce host to validate against: `global`, `us` or `eu`. |
-| `API_TIMEOUT` | Variable | — | Milliseconds before the validation request is aborted. |
+| `API_TIMEOUT` | Variable | `10000` | Milliseconds before the validation request is aborted. A value that is not a positive number is logged and replaced by the default. |
 | `VALID_STATUS` | Variable (JSON array) | — | Statuses you accept, e.g. `["valid","catch-all"]`. Anything else is rewritten to `INVALID`. |
 | `BYPASS_PATH` | Variable (JSON array) | — | Paths to forward untouched, e.g. `["/wp-login.php"]`. |
 | `LOGS` | KV namespace | — | When bound, every validation result is written to it. |
+
+### When validation fails
+
+The Worker fails open: if the validation request cannot produce a status (an invalid or drained API key, a timeout, a
+network error, a redirect, or any other API error), the submission is forwarded to your origin unvalidated, exactly as
+if the Worker were not there. Each such failure is logged with `console.error` (visible in Workers Logs and
+`wrangler tail`), naming the cause and the API's own message, so a dead key does not go unnoticed. The API key itself is
+never logged. The validation request does not follow redirects, since its URL carries the key.
+
+The Worker logs which address it validated and the result, but never a submitted form body, which can hold passwords.
 
 ### Choosing a region
 
@@ -72,7 +82,7 @@ BYPASS_PATH = ["/wp-login.php"]
 
 ## Development
 
-Node.js 20 or newer. There are no dependencies to install.
+Node.js 22 or newer. There are no dependencies to install.
 
 ```bash
 npm run lint   # node --check on the Worker source
@@ -80,16 +90,8 @@ npm test       # node --test, fully offline
 ```
 
 The suite in `tests/` evaluates the Worker in a `node:vm` context with a fake `fetch`, and covers the region selection,
-the shape of the validation request, and the `VALID_STATUS` gate. It never calls the live ZeroBounce API.
-
-You should see an output like this:
-
-```bash
-ℹ tests 13
-ℹ suites 0
-ℹ pass 13
-ℹ fail 0
-```
+the shape of the validation request, the `VALID_STATUS` gate, timeouts, redirects and failed validations. It never
+calls the live ZeroBounce API. The run ends with a summary; `fail 0` means every test passed.
 
 ## Contributing
 

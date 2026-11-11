@@ -134,6 +134,66 @@ function validationEndpoint() {
 }
 
 /**
+ * Milliseconds before the validation request is aborted when the optional
+ * API_TIMEOUT binding is not set, or is not a positive number.
+ */
+const DEFAULT_API_TIMEOUT_MS = 10000;
+
+function apiTimeout() {
+    if (typeof API_TIMEOUT === 'undefined' || API_TIMEOUT === null || API_TIMEOUT === '') {
+        return DEFAULT_API_TIMEOUT_MS;
+    }
+
+    const timeout = Number(API_TIMEOUT);
+
+    if (Number.isFinite(timeout) && timeout > 0) {
+        return timeout;
+    }
+
+    console.log(`Invalid API_TIMEOUT: ${API_TIMEOUT}. Using ${DEFAULT_API_TIMEOUT_MS} ms.`);
+
+    return DEFAULT_API_TIMEOUT_MS;
+}
+
+/** Removes the API key from text that is about to be logged or stored. */
+function redactKey(text) {
+    const value = String(text);
+    if (typeof API_KEY === 'undefined' || !API_KEY) {
+        return value;
+    }
+    return value.split(String(API_KEY)).join('***').split(encodeURIComponent(String(API_KEY))).join('***');
+}
+
+/**
+ * A failed validation, as the JSON text this function has always returned for
+ * one. Built with JSON.stringify so quotes in a message keep it valid JSON.
+ *
+ * Every failure is logged as an error: the Worker fails open (the submission
+ * is forwarded unvalidated, as the README documents), but never silently.
+ */
+function validationFailure(name, message) {
+    const safeMessage = redactKey(message);
+    console.error(`ZeroBounce validation failed (${name}): ${safeMessage}. The submission is forwarded unvalidated.`);
+    return JSON.stringify({ error: name, message: safeMessage });
+}
+
+/**
+ * The API's own error text when a body carries no validation result. LIVE: an
+ * invalid or drained key gets an HTTP 200 with {"error": "..."} and no status.
+ */
+function apiErrorText(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return 'ZeroBounce returned an unexpected response.';
+    }
+    for (const key of ['error', 'error_message', 'Error', 'message', 'Message']) {
+        if (typeof data[key] === 'string' && data[key].trim()) {
+            return data[key].trim();
+        }
+    }
+    return 'ZeroBounce returned no validation status.';
+}
+
+/**
  * Validates an email using the ZeroBounce real-time email validation API
  * The fetch request can be aborted automatically using a timeout.
  * The function is async however it waits itself for the response.
@@ -144,22 +204,37 @@ async function validateEmail(email, ip_address) {
 
         url.searchParams.set("api_key", API_KEY);
         url.searchParams.set("email", email);
-        url.searchParams.set("ip_address", ip_address);
+        // Optional: leave it out rather than send the string "null".
+        if (ip_address) {
+            url.searchParams.set("ip_address", ip_address);
+        }
 
         try {
             const resp = await fetch(url, {
-                signal: AbortSignal.timeout(API_TIMEOUT),
+                signal: AbortSignal.timeout(apiTimeout()),
+                // The URL carries the API key: never follow a redirect with it.
+                redirect: 'manual',
                 headers: {
                     'User-Agent': 'ZeroBounce Email Validator (Cloudflare Worker)'
                 }
             });
 
+            if (resp.status >= 300 && resp.status < 400) {
+                return validationFailure('Redirect', `ZeroBounce answered with a redirect (HTTP ${resp.status}), which this Worker does not follow`);
+            }
+
             const data = await resp.json();
+
+            if (!data || typeof data !== 'object' || !Object.prototype.hasOwnProperty.call(data, 'status')) {
+                // A dead or invalid key, or another API error, on any HTTP status.
+                const failure = validationFailure(`HTTP ${resp.status}`, apiErrorText(data));
+                return data && typeof data === 'object' ? data : failure;
+            }
 
             return data;
         } catch (err) {
-            // A network error, or some other problem.
-            return `{ "error": "${err.name}", "message": "${err.message}" }`;
+            // A network error, a timeout, a body that is not JSON, or some other problem.
+            return validationFailure(err && err.name ? err.name : 'Error', err && err.message ? err.message : String(err));
         }
     }
 }
@@ -231,7 +306,8 @@ async function handleRequest(event) {
 
                     return await fetch(newRequest);
                 } else {
-                    console.log(`Unable to find an email match in body: ${_body_text}`);
+                    // Never log the body itself: it can hold passwords and other form fields.
+                    console.log(`Unable to find an email match in a multipart body of ${_body.byteLength} bytes.`);
                 }
 
                 // Return original request untouched
@@ -324,7 +400,8 @@ async function handleRequest(event) {
 
                         return await fetch(newRequest);
                     } else {
-                        console.log(`Unable to find an email match in body: ${_body_text}`);
+                        // Never log the body itself: it can hold passwords and other form fields.
+                        console.log(`Unable to find an email match in a form body of ${_body.byteLength} bytes.`);
                     }
                 }
 
@@ -376,7 +453,7 @@ async function handleRequest(event) {
                             }
                         }
                     } else {
-                        console.log(`Unable to find an email match in json: ${_body}`);
+                        console.log(`Unable to find an email match in a JSON body with ${Object.keys(_form).length} form fields.`);
                     }
                 }
 

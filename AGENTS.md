@@ -28,7 +28,7 @@ npm run lint   # node --check cloudflare-worker-zerobounce.js
 npm test       # node --test
 ```
 
-Node.js 20 or newer. There are no dependencies and no lockfile; do not add one without a reason.
+Node.js 22 or newer. There are no dependencies and no lockfile; do not add one without a reason.
 
 ## Environment bindings
 
@@ -38,7 +38,7 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 | --- | --- |
 | `API_KEY` | ZeroBounce API key, an encrypted secret. Without it no validation happens. |
 | `API_REGION` | `us`, `eu`, or unset/`global` for the default host. |
-| `API_TIMEOUT` | Milliseconds, passed to `AbortSignal.timeout`. |
+| `API_TIMEOUT` | Milliseconds, passed to `AbortSignal.timeout`. Defaults to 10000 when unset or not a positive number. |
 | `VALID_STATUS` | Allow-list of ZeroBounce statuses. A status outside it is rewritten to `INVALID`. |
 | `BYPASS_PATH` | Paths that are forwarded untouched. |
 | `LOGS` | KV namespace. When bound, each validation result is written to it. |
@@ -61,6 +61,8 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 - **Keep the pass-through guarantee.** Every branch ends in `return await fetch(request)`, and
   `event.passThroughOnException()` means a thrown error silently forwards to the origin. A change that can hang or
   throw before that point breaks the customer's form instead of their bad addresses.
+- **Fail open, but never silently.** A validation that yields no status (dead key, timeout, redirect, network error)
+  forwards the submission unvalidated and is logged with `console.error`. Never log a form body or the API key.
 - **Match the surrounding style**: four-space indent, `console.log` for tracing, JSDoc blocks above each function. Do
   not reformat unrelated code and do not rewrite the Worker wholesale.
 
