@@ -55,6 +55,9 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   against a fixed allow-list and an unrecognised value falls back to the global host, so a typo cannot redirect the key.
 - **The three regexes are deliberate and fragile.** They are flagged `DO NOT EDIT!` upstream, they are built from
   strings (so every backslash is doubled), and the capture groups feed `$1INVALID` replacements. Do not "tidy" them.
+- **URL-encoded bodies are rewritten by byte span, never decoded and re-encoded as a whole.** `formFields` splits
+  the raw body on `&` and decodes each field with `URLSearchParams` (which never throws on bad percent-encoding);
+  `replaceFieldValues` swaps only the rejected value. Every other byte must reach the origin as sent.
 - **The Content-Type of a rewritten request is inherited from the incoming request.** When you change a body, keep its
   encoding: handing a `FormData` object to a request that still carries
   `Content-Type: application/x-www-form-urlencoded` produces a multipart body the origin cannot parse.

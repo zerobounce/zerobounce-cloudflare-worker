@@ -27,7 +27,7 @@ binding is optional: when one is missing the Worker falls back to forwarding the
 
 | Binding | Type | Default | Purpose |
 | --- | --- | --- | --- |
-| `API_KEY` | Secret | — | Your ZeroBounce API key. Without it the Worker validates nothing. |
+| `API_KEY` | Secret | — | Your ZeroBounce API key. Without it the Worker validates nothing. A key that is empty or contains whitespace or control characters (a pasted trailing newline, for example) is refused and logged, and nothing is validated. |
 | `API_REGION` | Variable | `global` | Which ZeroBounce host to validate against: `global`, `us` or `eu`. |
 | `API_TIMEOUT` | Variable | `10000` | Milliseconds before the validation request is aborted. A value that is not a positive number is logged and replaced by the default. |
 | `VALID_STATUS` | Variable (JSON array) | — | Statuses you accept, e.g. `["valid","catch-all"]`. Anything else is rewritten to `INVALID`. |
@@ -43,6 +43,13 @@ if the Worker were not there. Each such failure is logged with `console.error` (
 never logged. The validation request does not follow redirects, since its URL carries the key.
 
 The Worker logs which address it validated and the result, but never a submitted form body, which can hold passwords.
+
+### Which field is validated
+
+In a URL-encoded form the Worker validates the field named `email` (or `your-email`); without one, it validates the
+first field whose value is an email address. When the status is outside `VALID_STATUS`, the value of that field (and of
+any repeat of it) is replaced by `INVALID`. Every other byte of the body reaches your origin exactly as it was sent,
+including its percent-encoding.
 
 ### Choosing a region
 

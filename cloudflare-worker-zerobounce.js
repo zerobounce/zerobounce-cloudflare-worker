@@ -39,6 +39,12 @@ const regex2 = '(.*=)(([-!#-\'*+\\/-9=?A-Z^-~]+(\\.[-!#-\'*+\\/-9=?A-Z^-~]+)*|"(
 const regexFormBuffer = new RegExp(`${regex2}`, '');
 
 /**
+ * The address pattern of regex2 on its own, anchored, to test one decoded form
+ * value: regex2 is "(.*=)" + "(address)" + "&", and only the middle is kept.
+ */
+const regexFormValue = new RegExp(`^${regex2.slice('(.*=)'.length, -'&'.length)}$`, '');
+
+/**
  * Similar to the above.
  * DO NOT EDIT!
  * ------------
@@ -64,6 +70,59 @@ function textToBuffer(text) {
 function bufferToText(buffer) {
     const decoder = new TextDecoder();
     return decoder.decode(buffer);
+}
+
+/**
+ * Splits a URL-encoded body into its fields without decoding the body as a
+ * whole. Each field records its decoded name and value (decoded the way a
+ * browser or origin does, so malformed percent-encoding never throws) and the
+ * byte offsets of its raw value, so a value can be replaced while every other
+ * byte of the body reaches the origin exactly as it was sent.
+ */
+function formFields(bytes) {
+    const fields = [];
+    let start = 0;
+
+    while (start < bytes.length) {
+        let end = bytes.indexOf(0x26, start); // '&'
+        if (end === -1) {
+            end = bytes.length;
+        }
+
+        if (end > start) {
+            const raw = bytes.subarray(start, end);
+            const equals = raw.indexOf(0x3d); // '='
+            const [[name, value]] = new URLSearchParams(bufferToText(raw));
+
+            fields.push({ name, value, valueStart: equals === -1 ? end : start + equals + 1, end });
+        }
+
+        start = end + 1;
+    }
+
+    return fields;
+}
+
+/** Returns a copy of the body with the raw value of each given field replaced. */
+function replaceFieldValues(bytes, fields, replacement) {
+    const marker = textToBuffer(replacement);
+    const parts = [];
+    let position = 0;
+
+    for (const field of fields) {
+        parts.push(bytes.subarray(position, field.valueStart), marker);
+        position = field.end;
+    }
+    parts.push(bytes.subarray(position));
+
+    const body = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+    let offset = 0;
+    for (const part of parts) {
+        body.set(part, offset);
+        offset += part.length;
+    }
+
+    return body;
 }
 
 /**
@@ -200,6 +259,13 @@ function apiErrorText(data) {
  */
 async function validateEmail(email, ip_address) {
     if (typeof API_KEY !== 'undefined') {
+        // A pasted key often carries a trailing newline or space, which would
+        // be sent as %0A or %20 and fail on every request. Refuse it, without
+        // logging the key itself.
+        if (!/^[^\s\u0000-\u001f\u007f]+$/.test(String(API_KEY))) {
+            return validationFailure('Invalid API_KEY', 'API_KEY is empty or contains whitespace or control characters; check the secret');
+        }
+
         const url = new URL(validationEndpoint());
 
         url.searchParams.set("api_key", API_KEY);
@@ -313,15 +379,41 @@ async function handleRequest(event) {
                 // Return original request untouched
                 return await fetch(request);
             } else if (contentType === 'application/x-www-form-urlencoded') {
+                // The body is split into fields but never decoded or
+                // re-encoded as a whole: every field reaches the origin
+                // exactly as it was sent, and a rejected address is replaced
+                // in place.
+                const _body = new Uint8Array(await request.clone().arrayBuffer());
+                const fields = formFields(_body);
+
                 // Method 1:
                 // Try and extract the email from "normal inputs"
                 // ==========================================================
-                let _form = await request.clone().formData();
+                let field = fields.find((f) => f.name === 'email');
+                if (!field || !field.value) {
+                    field = fields.find((f) => f.name === 'your-email');
+                }
 
-                const email = _form.get('email') || _form.get('your-email');
+                if (field && field.value) {
+                    console.log(`Found email input: ${field.value}`);
+                }
+                // Method 2:
+                // Find the first field whose value is an email address
+                // This applies when the email input is not named accordingly (email)
+                // ==========================================================
+                else {
+                    field = fields.find((f) => regexFormValue.test(f.value));
 
-                if (email) {
-                    console.log(`Found email input: ${email}`);
+                    if (field) {
+                        console.log(`Matched email: ${field.value}`);
+                    } else {
+                        // Never log the body itself: it can hold passwords and other form fields.
+                        console.log(`Unable to find an email match in a form body of ${_body.byteLength} bytes.`);
+                    }
+                }
+
+                if (field) {
+                    const email = field.value;
 
                     let validate = await validateEmail(email, clientIP);
 
@@ -331,17 +423,16 @@ async function handleRequest(event) {
                         console.log(`Email validation status: ${validate.status}`);
 
                         if (typeof VALID_STATUS !== 'undefined' && !VALID_STATUS.includes(validate.status)) {
-                            _form.set('email', `INVALID`);
+                            // Rewrite the field that held the address, and any
+                            // repeat of it, so the rejected address never
+                            // reaches the origin.
+                            const rejected = fields.filter((f) => f.name === field.name && f.value);
 
                             const newRequestInit = {
                                 // The incoming Content-Type header is carried
-                                // over to the new request, so the body has to
-                                // stay URL-encoded. Passing the FormData
-                                // object straight through produces a
-                                // multipart body that is still labelled
-                                // application/x-www-form-urlencoded, which the
-                                // origin cannot parse.
-                                body: new URLSearchParams([..._form]).toString(),
+                                // over to the new request, so the body stays
+                                // URL-encoded.
+                                body: replaceFieldValues(_body, rejected, 'INVALID'),
                             };
 
                             const newRequest = new Request(
@@ -353,55 +444,6 @@ async function handleRequest(event) {
 
                             return await fetch(newRequest);
                         }
-                    }
-                }
-                // Method 2:
-                // Try and extract the email from the parsed body itself
-                // This applies when the email input is not named accordignly (email)
-                // ==========================================================
-                else {
-                    console.log(`Unable to find email input: ${email}`);
-
-                    // Clone the request data as buffer
-                    const _body = await request.clone().arrayBuffer();
-
-                    let _body_text = decodeURIComponent(bufferToText(_body));
-
-                    // Find the email
-                    let m;
-                    if ((m = regexFormBuffer.exec(_body_text)) !== null) {
-                        const email = m[2];
-                        console.log(`Matched email: ${email}`);
-
-                        let validate = await validateEmail(email, clientIP);
-
-                        await logValidation(event, email, pathname, validate);
-
-                        if (validate.hasOwnProperty('status')) {
-                            console.log(`Email validation status: ${validate.status}`);
-
-                            if (typeof VALID_STATUS !== 'undefined' && !VALID_STATUS.includes(validate.status)) {
-                                _body_text = _body_text.replace(regexFormBuffer, `$1INVALID`);
-                            }
-                        }
-
-                        const _body_buffer = textToBuffer(_body_text);
-
-                        const newRequestInit = {
-                            body: _body_buffer,
-                        };
-
-                        const newRequest = new Request(
-                            request.url.toString(),
-                            new Request(request, newRequestInit)
-                        );
-
-                        console.log(`Returning modified request.`);
-
-                        return await fetch(newRequest);
-                    } else {
-                        // Never log the body itself: it can hold passwords and other form fields.
-                        console.log(`Unable to find an email match in a form body of ${_body.byteLength} bytes.`);
                     }
                 }
 
