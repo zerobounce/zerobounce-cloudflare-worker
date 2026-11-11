@@ -443,3 +443,81 @@ test('a transport error message with quotes still yields valid JSON', async () =
 
     assert.deepStrictEqual(JSON.parse(result), { error: 'TypeError', message: 'unexpected token "<" in "body"' });
 });
+
+// ---------------------------------------------------------------------------
+// URL-encoded bodies reach the origin byte for byte
+// ---------------------------------------------------------------------------
+
+test('a form whose address field has another name is forwarded byte for byte when the address is accepted', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'valid' } });
+    const sent = 'contact=john%40example.com&note=a%26b%3Dc&pw=p%2Bq%25&greeting=hello+world';
+
+    await context.handleRequest(fetchEvent(formRequest(sent)));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'john@example.com');
+    assert.strictEqual(await calls.forwarded[0].text(), sent);
+});
+
+test('a rejected address in a field with another name becomes INVALID and nothing else changes', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(formRequest('contact=john%40example.com&note=a%26b%3Dc&x=1')));
+
+    const body = await calls.forwarded[0].text();
+    assert.strictEqual(body, 'contact=INVALID&note=a%26b%3Dc&x=1');
+    assert.deepStrictEqual([...new URLSearchParams(body)], [['contact', 'INVALID'], ['note', 'a&b=c'], ['x', '1']]);
+});
+
+test('an address in the last field is validated and rewritten too', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(formRequest('name=T&contact=john%40example.com')));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(await calls.forwarded[0].text(), 'name=T&contact=INVALID');
+});
+
+test('malformed percent-encoding elsewhere in the form does not skip validation', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(formRequest('contact=john%40example.com&x=%E0%A4%A&y=1')));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'john@example.com');
+    assert.strictEqual(await calls.forwarded[0].text(), 'contact=INVALID&x=%E0%A4%A&y=1');
+});
+
+test('a rejected your-email address is itself rewritten, and no extra email field is added', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(formRequest('your-email=bad%40example.com&name=T%26C')));
+
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'bad@example.com');
+    assert.strictEqual(await calls.forwarded[0].text(), 'your-email=INVALID&name=T%26C');
+});
+
+test('a rejected email field is rewritten in place and the other fields keep their encoding', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(formRequest('name=Jo%20Doe&email=bad%40example.com&email=other%40example.com&n=%7E')));
+
+    assert.strictEqual(await calls.forwarded[0].text(), 'name=Jo%20Doe&email=INVALID&email=INVALID&n=%7E');
+});
+
+// ---------------------------------------------------------------------------
+// A malformed API_KEY binding
+// ---------------------------------------------------------------------------
+
+test('an API_KEY with whitespace or control characters is refused and logged, and no request is made', async () => {
+    for (const badKey of [`${API_KEY}\n`, ` ${API_KEY}`, `${API_KEY}\t`, `${API_KEY}\u0000x`, `${API_KEY}\u007f`, 'two words', '']) {
+        const { context, calls, errors } = loadWorker({ API_KEY: badKey, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+
+        assert.strictEqual(calls.validation.length, 0, `no request for ${JSON.stringify(badKey)}`);
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+        assert.ok(errors.some((line) => line.includes('API_KEY')), `expected an error log line for ${JSON.stringify(badKey)}`);
+        assert.ok(errors.every((line) => !line.includes(API_KEY)), 'the API key must not be logged');
+    }
+});
