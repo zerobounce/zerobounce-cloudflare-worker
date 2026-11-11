@@ -29,9 +29,10 @@ const API_KEY = 'test-api-key-placeholder';
  * VALID_STATUS, BYPASS_PATH, ...). The returned object exposes the Worker's
  * top-level functions plus the recorded fetch calls.
  */
-function loadWorker(bindings = {}, { validationResponse = { status: 'valid' } } = {}) {
+function loadWorker(bindings = {}, { validationResponse = { status: 'valid' }, unbind = [] } = {}) {
     const calls = { validation: [], forwarded: [] };
     const logs = [];
+    const errors = [];
 
     const context = {
         URL,
@@ -49,7 +50,10 @@ function loadWorker(bindings = {}, { validationResponse = { status: 'valid' } } 
         Date,
         String,
         RegExp,
-        console: { log: (message) => logs.push(String(message)) },
+        console: {
+            log: (message) => logs.push(String(message)),
+            error: (message) => errors.push(String(message)),
+        },
         // The Worker registers its fetch listener at the top level.
         addEventListener: () => {},
         fetch: async (input, init) => {
@@ -67,11 +71,15 @@ function loadWorker(bindings = {}, { validationResponse = { status: 'valid' } } 
         API_TIMEOUT: 5000,
         ...bindings,
     };
+    // A binding that is not set at all, as opposed to one set to undefined.
+    for (const name of unbind) {
+        delete context[name];
+    }
 
     vm.createContext(context);
     vm.runInContext(WORKER_SOURCE, context);
 
-    return { context, calls, logs };
+    return { context, calls, logs, errors };
 }
 
 /** A minimal stand-in for the Cloudflare FetchEvent. */
@@ -286,4 +294,144 @@ test('a GET request is forwarded without being validated', async () => {
 
     assert.strictEqual(calls.validation.length, 0);
     assert.strictEqual(calls.forwarded.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Timeouts, redirects and failed validations
+// ---------------------------------------------------------------------------
+
+/** Records the timeout each validation request was given. */
+function recordingAbortSignal(seen) {
+    return {
+        timeout: (ms) => {
+            seen.push(ms);
+            return AbortSignal.timeout(ms);
+        },
+    };
+}
+
+test('without an API_TIMEOUT binding the request still goes out, with a 10 s default timeout', async () => {
+    const seen = [];
+    const { context, calls } = loadWorker(
+        { API_KEY, AbortSignal: recordingAbortSignal(seen) },
+        { unbind: ['API_TIMEOUT'] }
+    );
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.deepStrictEqual(seen, [10000]);
+    assert.strictEqual(result.status, 'valid');
+});
+
+test('an API_TIMEOUT that is not a positive number falls back to the default and is logged', async () => {
+    const seen = [];
+    const { context, logs } = loadWorker({ API_KEY, API_TIMEOUT: 'soon', AbortSignal: recordingAbortSignal(seen) });
+
+    await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.deepStrictEqual(seen, [10000]);
+    assert.ok(logs.some((line) => line.includes('Invalid API_TIMEOUT')), 'expected a log line');
+});
+
+test('a validation request that times out is logged as an error and the form is forwarded untouched', async () => {
+    const { context, calls, errors } = loadWorker({ API_KEY, API_TIMEOUT: 20, VALID_STATUS: ['valid'] });
+    context.fetch = async (input, init) => {
+        if (input instanceof Request) {
+            calls.forwarded.push(input);
+            return new Response('origin response');
+        }
+        calls.validation.push({ url: new URL(String(input)), init });
+        // Never answers: only the timeout can end this request.
+        return new Promise((resolve, reject) => {
+            init.signal.addEventListener('abort', () => reject(init.signal.reason));
+        });
+    };
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+    assert.strictEqual(JSON.parse(result).error, 'TimeoutError');
+    assert.ok(errors.some((line) => line.includes('TimeoutError')), 'expected an error log line');
+
+    await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+    assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+});
+
+test('the validation request does not follow redirects, and a 3xx answer is a logged failure', async () => {
+    const { context, calls, errors } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    const followed = [];
+    context.fetch = async (input, init) => {
+        if (input instanceof Request) {
+            calls.forwarded.push(input);
+            return new Response('origin response');
+        }
+        const url = new URL(String(input));
+        if (url.hostname !== 'api.zerobounce.net') followed.push(url);
+        calls.validation.push({ url, init });
+        return new Response(null, { status: 302, headers: { location: 'https://elsewhere.example/collect' } });
+    };
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.strictEqual(calls.validation[0].init.redirect, 'manual');
+    assert.strictEqual(followed.length, 0);
+    assert.deepStrictEqual(JSON.parse(result).error, 'Redirect');
+    assert.ok(errors.some((line) => line.includes('HTTP 302')), 'expected an error log line');
+    assert.ok(errors.every((line) => !line.includes(API_KEY)), 'the API key must not be logged');
+});
+
+test('a dead key is logged as an error and the submission is forwarded unvalidated', async () => {
+    const message = 'Invalid API key or your account ran out of credits';
+    const { context, calls, errors } = loadWorker(
+        { API_KEY, VALID_STATUS: ['valid'] },
+        { validationResponse: { error: message } }
+    );
+
+    await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+    assert.ok(errors.some((line) => line.includes(message)), 'expected the API message in an error log line');
+    assert.ok(errors.every((line) => !line.includes(API_KEY)), 'the API key must not be logged');
+});
+
+test('ip_address is left out when the CF-Connecting-IP header is missing', async () => {
+    const { context, calls } = loadWorker({ API_KEY });
+
+    await context.validateEmail('test@example.com', null);
+
+    assert.strictEqual(calls.validation[0].url.searchParams.has('ip_address'), false);
+});
+
+test('a body without a recognisable address is not written to the log', async () => {
+    const secret = 'hunter2-not-a-real-password';
+    const { context, calls, logs } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+
+    await context.handleRequest(fetchEvent(formRequest(`user=someone&password=${secret}`)));
+
+    const boundary = '----zbtestboundary';
+    const multipart =
+        `--${boundary}\r\n` +
+        'Content-Disposition: form-data; name="password"\r\n\r\n' +
+        `${secret}\r\n` +
+        `--${boundary}--\r\n`;
+    await context.handleRequest(fetchEvent(new Request('https://example.com/login', {
+        method: 'POST',
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        body: multipart,
+    })));
+
+    assert.strictEqual(calls.validation.length, 0);
+    assert.strictEqual(calls.forwarded.length, 2);
+    assert.ok(logs.every((line) => !line.includes(secret)), 'a form body must never be logged');
+});
+
+test('a transport error message with quotes still yields valid JSON', async () => {
+    const { context } = loadWorker({ API_KEY });
+    context.fetch = async () => {
+        throw new TypeError('unexpected token "<" in "body"');
+    };
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.deepStrictEqual(JSON.parse(result), { error: 'TypeError', message: 'unexpected token "<" in "body"' });
 });
