@@ -348,12 +348,20 @@ test('a validation request that times out is logged as an error and the form is 
         });
     };
 
-    const result = await context.validateEmail('test@example.com', '198.51.100.7');
-    assert.strictEqual(JSON.parse(result).error, 'TimeoutError');
-    assert.ok(errors.some((line) => line.includes('TimeoutError')), 'expected an error log line');
+    // AbortSignal.timeout() uses an unref'd timer, so while the fake fetch above waits
+    // forever nothing keeps the event loop alive, and Node 22's test runner cancels the
+    // test (and the rest of the file). Hold a ref'd timer for both timed-out requests.
+    const keepAlive = setInterval(() => {}, 1000);
+    try {
+        const result = await context.validateEmail('test@example.com', '198.51.100.7');
+        assert.strictEqual(JSON.parse(result).error, 'TimeoutError');
+        assert.ok(errors.some((line) => line.includes('TimeoutError')), 'expected an error log line');
 
-    await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
-    assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+    } finally {
+        clearInterval(keepAlive);
+    }
 });
 
 test('the validation request does not follow redirects, and a 3xx answer is a logged failure', async () => {
