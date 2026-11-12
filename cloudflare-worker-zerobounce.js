@@ -126,6 +126,98 @@ function replaceFieldValues(bytes, fields, replacement) {
 }
 
 /**
+ * The media type of a Content-Type header in lower case, without its
+ * parameters: "Application/X-WWW-Form-URLEncoded; charset=UTF-8" becomes
+ * "application/x-www-form-urlencoded".
+ */
+function mediaType(contentType) {
+    return String(contentType).split(';')[0].trim().toLowerCase();
+}
+
+/** The boundary parameter of a multipart Content-Type header, or null. */
+function multipartBoundary(contentType) {
+    const match = /;\s*boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType));
+    return match ? (match[1] || match[2]) : null;
+}
+
+/** The index of the first occurrence of `pattern` in `bytes` at or after `from`, or -1. */
+function indexOfBytes(bytes, pattern, from = 0, to = bytes.length) {
+    for (let i = bytes.indexOf(pattern[0], from); i !== -1 && i + pattern.length <= to; i = bytes.indexOf(pattern[0], i + 1)) {
+        let j = 1;
+        while (j < pattern.length && bytes[i + j] === pattern[j]) {
+            j++;
+        }
+        if (j === pattern.length) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * One character per byte, so an index in the string is the same index in the
+ * bytes. Used only to run the address regex over a form field; the result is
+ * never encoded back into the body.
+ */
+function bytesToBinaryString(bytes) {
+    let text = '';
+    for (let i = 0; i < bytes.length; i += 0x2000) {
+        text += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x2000));
+    }
+    return text;
+}
+
+/**
+ * Finds the first address in the non-file parts of a multipart body, without
+ * decoding the body as text. Returns the address and the byte offsets of the
+ * text regexBodyBuffer matched (the span its "$1INVALID" replacement changes),
+ * or null. File parts are skipped: their bytes, binary or not, are never read
+ * as an address and never rewritten.
+ */
+function multipartAddress(bytes, boundary) {
+    const LF = 0x0a;
+    const CR = 0x0d;
+    // Delimiters are "--boundary" at the start of a line; CRLF is the standard
+    // line break, and a bare LF is accepted as well.
+    const delimiter = textToBuffer(`\n--${boundary}`);
+    let next = indexOfBytes(bytes, delimiter.subarray(1)) === 0 ? 0 : indexOfBytes(bytes, delimiter);
+    let after = next === 0 ? delimiter.length - 1 : next + delimiter.length;
+
+    while (next !== -1) {
+        // The closing delimiter ends with "--".
+        if (bytes[after] === 0x2d && bytes[after + 1] === 0x2d) {
+            break;
+        }
+        const lineEnd = bytes.indexOf(LF, after);
+        if (lineEnd === -1) {
+            break;
+        }
+        const start = lineEnd + 1;
+        next = indexOfBytes(bytes, delimiter, start);
+        if (next === -1) {
+            break;
+        }
+        const end = next > start && bytes[next - 1] === CR ? next - 1 : next;
+        after = next + delimiter.length;
+
+        const blank = [indexOfBytes(bytes, textToBuffer('\n\r\n'), start, end), indexOfBytes(bytes, textToBuffer('\n\n'), start, end)]
+            .filter((i) => i !== -1);
+        const headers = bufferToText(bytes.subarray(start, blank.length ? Math.min(...blank) : end));
+        if (/;\s*filename\*?\s*=/i.test(headers)) {
+            continue;
+        }
+
+        const m = regexBodyBuffer.exec(bytesToBinaryString(bytes.subarray(start, end)));
+        if (m !== null) {
+            const valueStart = start + m.index + m[1].length;
+            return { email: m[2], valueStart, end: valueStart + m[2].length };
+        }
+    }
+
+    return null;
+}
+
+/**
  * Logs validations into the Worker KV Namespace
  */
 function logValidation(event, email, url, result) {
@@ -334,14 +426,16 @@ async function handleRequest(event) {
         if (contentType) {
             console.log(`Incoming content type: ${contentType}`);
 
-            if (contentType.includes('multipart/form-data')) {
-                const _body = await request.clone().arrayBuffer();
+            if (mediaType(contentType) === 'multipart/form-data') {
+                // The body is searched part by part and never decoded or
+                // re-encoded as a whole: file parts reach the origin byte for
+                // byte, and a rejected address is replaced in place.
+                const _body = new Uint8Array(await request.clone().arrayBuffer());
+                const boundary = multipartBoundary(contentType);
+                const match = boundary ? multipartAddress(_body, boundary) : null;
 
-                let _body_text = bufferToText(_body);
-
-                let m;
-                if ((m = regexBodyBuffer.exec(_body_text)) !== null) {
-                    const email = m[2];
+                if (match !== null) {
+                    const email = match.email;
                     console.log(`Matched email: ${email}`);
 
                     let validate = await validateEmail(email, clientIP);
@@ -352,25 +446,21 @@ async function handleRequest(event) {
                         console.log(`Email validation status: ${validate.status}`);
 
                         if (typeof VALID_STATUS !== 'undefined' && !VALID_STATUS.includes(validate.status)) {
-                            _body_text = _body_text.replace(regexBodyBuffer, `$1INVALID`);
+                            const newRequestInit = {
+                                // Change body
+                                body: replaceFieldValues(_body, [match], 'INVALID'),
+                            };
+
+                            const newRequest = new Request(
+                                request.url.toString(),
+                                new Request(request, newRequestInit)
+                            );
+
+                            console.log(`Returning modified request.`);
+
+                            return await fetch(newRequest);
                         }
                     }
-
-                    const _body_buffer = textToBuffer(_body_text);
-
-                    const newRequestInit = {
-                        // Change body
-                        body: _body_buffer,
-                    };
-
-                    const newRequest = new Request(
-                        request.url.toString(),
-                        new Request(request, newRequestInit)
-                    );
-
-                    console.log(`Returning modified request.`);
-
-                    return await fetch(newRequest);
                 } else {
                     // Never log the body itself: it can hold passwords and other form fields.
                     console.log(`Unable to find an email match in a multipart body of ${_body.byteLength} bytes.`);
@@ -378,7 +468,7 @@ async function handleRequest(event) {
 
                 // Return original request untouched
                 return await fetch(request);
-            } else if (contentType === 'application/x-www-form-urlencoded') {
+            } else if (mediaType(contentType) === 'application/x-www-form-urlencoded') {
                 // The body is split into fields but never decoded or
                 // re-encoded as a whole: every field reaches the origin
                 // exactly as it was sent, and a rejected address is replaced
@@ -452,7 +542,7 @@ async function handleRequest(event) {
                 return await fetch(request);
             }
             // Experimental
-            else if (contentType.includes('application/json')) {
+            else if (mediaType(contentType) === 'application/json') {
                 const _body = await request.clone().json();
 
                 if (_body.hasOwnProperty('form')) {

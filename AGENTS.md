@@ -58,6 +58,12 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 - **URL-encoded bodies are rewritten by byte span, never decoded and re-encoded as a whole.** `formFields` splits
   the raw body on `&` and decodes each field with `URLSearchParams` (which never throws on bad percent-encoding);
   `replaceFieldValues` swaps only the rejected value. Every other byte must reach the origin as sent.
+- **Multipart bodies are never decoded as a whole either.** `multipartAddress` splits the raw body on its boundary,
+  skips file parts, and runs the multipart regex over each remaining part as a one-character-per-byte string, so a
+  match's offsets are byte offsets; `replaceFieldValues` then swaps only the address. A UTF-8 decode and re-encode of
+  the body would replace every non-UTF-8 byte of an uploaded file with U+FFFD.
+- **Content types are compared by media type** (`mediaType`: lower case, parameters dropped), never with `===` on the
+  header or with `includes`.
 - **The Content-Type of a rewritten request is inherited from the incoming request.** When you change a body, keep its
   encoding: handing a `FormData` object to a request that still carries
   `Content-Type: application/x-www-form-urlencoded` produces a multipart body the origin cannot parse.
@@ -73,9 +79,6 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 
 Changing these would alter live behaviour, so they are documented rather than fixed. Raise them with a maintainer first.
 
-- The URL-encoded branch compares `contentType === 'application/x-www-form-urlencoded'` exactly, so a request whose
-  header carries a charset (`...; charset=UTF-8`) is forwarded without validation. The multipart and JSON branches use
-  `includes` instead.
 - In the JSON branch, `Object.keys(_form).filter(...)` returns an array, which is always truthy, so the matching `else`
   branch is unreachable, and `_form[email_key]` only works while exactly one key starts with `email`.
 - The `[\\r\\n]+` alternative in the first regex matches the literal characters `\`, `r`, `n` rather than a newline.
