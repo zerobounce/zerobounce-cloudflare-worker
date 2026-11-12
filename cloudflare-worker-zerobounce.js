@@ -314,18 +314,31 @@ function redactKey(text) {
         return value;
     }
     const key = String(API_KEY);
-    // The bases: raw, JSON-escaped (a body quoting a JSON copy of the key),
-    // the same with "/" escaped as "\/", and JSON-escaped twice. Each also
-    // URL-encoded and form-encoded as URLSearchParams writes it ("'" as %27, as
-    // in the request URL), for a body that echoes the request URL-encoded.
-    // Longest first, so no form leaves part of a longer one behind.
-    const json = JSON.stringify(key).slice(1, -1);
-    const bases = [key, json, json.replace(/\//g, '\\/'), JSON.stringify(json).slice(1, -1)];
-    const forms = [...new Set(bases.flatMap((base) => [
-        base,
-        encodeURIComponent(base),
-        new URLSearchParams({ s: base }).toString().slice(2),
-    ]))].sort((a, b) => b.length - a.length);
+    // Composed from the encoders a body can apply: the raw key and each one-
+    // or two-step JSON quoting of it (a body quoting a JSON copy of the key,
+    // and a JSON copy of that quote), with or without "/" escaped as "\/" at
+    // each step; each as is, URL-encoded (spaces as %20) and form-encoded as
+    // URLSearchParams writes it ("+", "'" as %27, as in the request URL), for
+    // a body that echoes the request URL-encoded. Longest first, so no form
+    // leaves part of a longer one behind.
+    const quotings = [
+        (text) => JSON.stringify(text).slice(1, -1),
+        (text) => JSON.stringify(text).slice(1, -1).replace(/\//g, '\\/'),
+    ];
+    const encodings = [
+        (text) => text,
+        (text) => encodeURIComponent(text),
+        (text) => new URLSearchParams({ s: text }).toString().slice(2),
+    ];
+    const quoted = [key];
+    for (const once of quotings) {
+        quoted.push(once(key));
+        for (const twice of quotings) {
+            quoted.push(twice(once(key)));
+        }
+    }
+    const forms = [...new Set(quoted.flatMap((text) => encodings.map((encode) => encode(text))))]
+        .sort((a, b) => b.length - a.length);
     return forms.reduce((text, form) => text.split(form).join('***'), value);
 }
 
@@ -429,7 +442,16 @@ async function validateEmail(email, ip_address) {
                 return validationFailure(`HTTP ${resp.status}`, 'ZeroBounce returned an HTML page instead of an API response');
             }
 
-            const data = await resp.json();
+            // A body cut short throws here, as the transport error it is.
+            const text = await resp.text();
+            let data;
+            try {
+                data = JSON.parse(text);
+            } catch (err) {
+                // A 2xx that is not JSON (plain text, or CSV under
+                // application/json) is an API error with its status.
+                return validationFailure(`HTTP ${resp.status}`, 'ZeroBounce returned a response that is not JSON');
+            }
 
             if (
                 !data ||
@@ -447,7 +469,7 @@ async function validateEmail(email, ip_address) {
 
             return data;
         } catch (err) {
-            // A network error, a timeout, a body that is not JSON, or some other problem.
+            // A network error, a timeout, a body cut short, or some other problem.
             return validationFailure(err && err.name ? err.name : 'Error', err && err.message ? err.message : String(err));
         }
     }

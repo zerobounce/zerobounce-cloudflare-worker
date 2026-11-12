@@ -738,25 +738,35 @@ test('a JSON-escaped copy of the API key in an error message is redacted in the 
     }
 });
 
-test('the API key is redacted in each of its forms, URL-encoded JSON-escaped included, needing every one', async () => {
+test('the API key is redacted in every composed form (JSON-escaped up to twice, with and without \\/, URL- and form-encoded), needing every one', async () => {
     // A quote, "/", "+", "%", "&", "=", "<", ">", "'" and "\\" (the Worker
-    // refuses a key with whitespace): every form below differs from every other.
+    // refuses a key with whitespace, so no space): every form differs.
     const key = `key"/+%&=<>'\\z`;
-    const json = JSON.stringify(key).slice(1, -1);
-    const form = (text) => new URLSearchParams({ s: text }).toString().slice(2);
-    const bases = {
-        raw: key,
-        json,
-        'json, / as \\/': json.replace(/\//g, '\\/'),
-        'json twice': JSON.stringify(json).slice(1, -1),
+    // Composed here from the encoders, independently of the Worker's list.
+    const quotings = {
+        'JSON-escaped': (text) => JSON.stringify(text).slice(1, -1),
+        'JSON-escaped, / as \\/': (text) => JSON.stringify(text).slice(1, -1).replace(/\//g, '\\/'),
     };
-    const forms = {};
-    for (const [name, base] of Object.entries(bases)) {
-        forms[name] = base;
-        forms[`${name}, URL-encoded`] = encodeURIComponent(base);
-        forms[`${name}, form-encoded`] = form(base);
+    const encodings = {
+        '': (text) => text,
+        ', URL-encoded (%20)': (text) => encodeURIComponent(text),
+        ', form-encoded (+)': (text) => new URLSearchParams({ s: text }).toString().slice(2),
+    };
+    const quoted = { raw: key };
+    for (const [first, once] of Object.entries(quotings)) {
+        quoted[first] = once(key);
+        for (const [second, twice] of Object.entries(quotings)) {
+            quoted[`${first}, then ${second}`] = twice(once(key));
+        }
     }
-    assert.strictEqual(new Set(Object.values(forms)).size, Object.keys(forms).length);
+    const forms = {};
+    for (const [quoting, text] of Object.entries(quoted)) {
+        for (const [encoding, encode] of Object.entries(encodings)) {
+            forms[`${quoting}${encoding}`] = encode(text);
+        }
+    }
+    assert.strictEqual(Object.keys(forms).length, 21);
+    assert.strictEqual(new Set(Object.values(forms)).size, 21);
     const { context } = loadWorker({ API_KEY: key });
     const messageFor = async (echo) => {
         context.fetch = async () => jsonResponse(200, { error: `Invalid API key [${echo}]` });
@@ -803,7 +813,8 @@ const FAILURE_MODES = [
     { name: '200 error quoting the request URL', respond: (url) => jsonResponse(200, { error: `Invalid API key for ${url}` }) },
     { name: '200 success:false quoting the key', respond: () => jsonResponse(200, { success: false, message: `Rejected ${KEY_WITH_ENCODING}` }) },
     { name: '200 object without status or message', respond: () => jsonResponse(200, { key: KEY_WITH_ENCODING }) },
-    { name: '200 body that is not JSON', respond: (url) => new Response(`oops ${url}`, { status: 200 }) },
+    { name: '200 body that is not JSON', status: 200, respond: (url) => new Response(`oops ${url}`, { status: 200 }) },
+    { name: '200 CSV under application/json', status: 200, respond: (url) => new Response(`email,status\n${url},valid\n`, { status: 200, headers: { 'content-type': 'application/json' } }) },
     { name: '400 text/plain quoting the request URL', status: 400, respond: (url) => new Response(`Bad request: ${url}`, { status: 400, headers: { 'content-type': 'text/plain' } }) },
     { name: '400 JSON error quoting the key', status: 400, respond: () => jsonResponse(400, { error: `Invalid API key ${KEY_WITH_ENCODING}` }) },
     { name: '500 JSON with a status field', status: 500, respond: () => jsonResponse(500, { status: 'error', message: `Internal error for ${KEY_WITH_ENCODING}` }) },
