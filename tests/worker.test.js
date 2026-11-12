@@ -738,6 +738,56 @@ test('a JSON-escaped copy of the API key in an error message is redacted in the 
     }
 });
 
+test('the API key is redacted in each of its forms, URL-encoded JSON-escaped included, needing every one', async () => {
+    // A quote, "/", "+", "%", "&", "=", "<", ">", "'" and "\\" (the Worker
+    // refuses a key with whitespace): every form below differs from every other.
+    const key = `key"/+%&=<>'\\z`;
+    const json = JSON.stringify(key).slice(1, -1);
+    const form = (text) => new URLSearchParams({ s: text }).toString().slice(2);
+    const bases = {
+        raw: key,
+        json,
+        'json, / as \\/': json.replace(/\//g, '\\/'),
+        'json twice': JSON.stringify(json).slice(1, -1),
+    };
+    const forms = {};
+    for (const [name, base] of Object.entries(bases)) {
+        forms[name] = base;
+        forms[`${name}, URL-encoded`] = encodeURIComponent(base);
+        forms[`${name}, form-encoded`] = form(base);
+    }
+    assert.strictEqual(new Set(Object.values(forms)).size, Object.keys(forms).length);
+    const { context } = loadWorker({ API_KEY: key });
+    const messageFor = async (echo) => {
+        context.fetch = async () => jsonResponse(200, { error: `Invalid API key [${echo}]` });
+        return JSON.parse(await context.validateEmail('test@example.com', '198.51.100.7')).message;
+    };
+    // Each form, echoed on its own, must come back exactly as "***" would: a
+    // form left out leaks, or leaves the tail of a longer form behind.
+    const expected = await messageFor('***');
+    assert.ok(expected.includes('[***]'), expected);
+    const got = {};
+    for (const [name, echo] of Object.entries(forms)) {
+        got[name] = await messageFor(echo);
+    }
+    assert.deepStrictEqual(got, Object.fromEntries(Object.keys(forms).map((name) => [name, expected])));
+});
+
+test('a 2xx answer served as text/html is not a validation result, though its body parses', async () => {
+    const { context, errors } = loadWorker({ API_KEY });
+    const body = JSON.stringify({ status: 'invalid', address: 'test@example.com' });
+    // The same body as JSON is a result, so only the content type tells them apart.
+    context.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+    assert.deepStrictEqual(await context.validateEmail('test@example.com', '198.51.100.7'), JSON.parse(body));
+
+    context.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.strictEqual(typeof result, 'string', 'a failure payload, not a validation result');
+    assert.strictEqual(JSON.parse(result).error, 'HTTP 200');
+    assert.ok(errors.some((line) => line.includes('HTTP 200')));
+});
+
 // ---------------------------------------------------------------------------
 // API errors fail open, and nothing stored or logged carries the key
 // ---------------------------------------------------------------------------

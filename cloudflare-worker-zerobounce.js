@@ -314,12 +314,18 @@ function redactKey(text) {
         return value;
     }
     const key = String(API_KEY);
-    // Raw, URL-encoded, and JSON-escaped (with and without "/" escaped as
-    // "\/"), as a body quoting a JSON copy of the key would carry it. Longest
-    // first, so no form leaves part of a longer one behind.
+    // The bases: raw, JSON-escaped (a body quoting a JSON copy of the key),
+    // the same with "/" escaped as "\/", and JSON-escaped twice. Each also
+    // URL-encoded and form-encoded as URLSearchParams writes it ("'" as %27, as
+    // in the request URL), for a body that echoes the request URL-encoded.
+    // Longest first, so no form leaves part of a longer one behind.
     const json = JSON.stringify(key).slice(1, -1);
-    const forms = [...new Set([key, encodeURIComponent(key), json, json.replace(/\//g, '\\/')])]
-        .sort((a, b) => b.length - a.length);
+    const bases = [key, json, json.replace(/\//g, '\\/'), JSON.stringify(json).slice(1, -1)];
+    const forms = [...new Set(bases.flatMap((base) => [
+        base,
+        encodeURIComponent(base),
+        new URLSearchParams({ s: base }).toString().slice(2),
+    ]))].sort((a, b) => b.length - a.length);
     return forms.reduce((text, form) => text.split(form).join('***'), value);
 }
 
@@ -415,6 +421,12 @@ async function validateEmail(email, ip_address) {
                     // Not JSON (an HTML error page, plain text, or an empty body).
                 }
                 return validationFailure(`HTTP ${resp.status}`, body && typeof body === 'object' ? apiErrorText(body, fallback) : fallback);
+            }
+
+            // An HTML page (a proxy or challenge page) is never a validation
+            // result, even when its body happens to parse as JSON.
+            if (String(resp.headers.get('content-type') || '').toLowerCase().includes('text/html')) {
+                return validationFailure(`HTTP ${resp.status}`, 'ZeroBounce returned an HTML page instead of an API response');
             }
 
             const data = await resp.json();
