@@ -685,3 +685,101 @@ test('an error message carrying the API key is redacted in the log and in the re
     }
     assert.match(JSON.parse(result).message, /api_key=\*\*\*&email=x/);
 });
+
+// ---------------------------------------------------------------------------
+// API errors fail open, and nothing stored or logged carries the key
+// ---------------------------------------------------------------------------
+
+/**
+ * Every way the validation request can fail. `respond(url)` answers the
+ * validation request; `url` is the full request URL, query string and key
+ * included, so a body can quote it the way a proxy or an error page might.
+ */
+const KEY_WITH_ENCODING = 'test/key+placeholder=1';
+const FAILURE_MODES = [
+    { name: '200 dead key quoting the key', respond: () => jsonResponse(200, { error: `Invalid API key ${KEY_WITH_ENCODING}` }) },
+    { name: '200 error quoting the request URL', respond: (url) => jsonResponse(200, { error: `Invalid API key for ${url}` }) },
+    { name: '200 success:false quoting the key', respond: () => jsonResponse(200, { success: false, message: `Rejected ${KEY_WITH_ENCODING}` }) },
+    { name: '200 object without status or message', respond: () => jsonResponse(200, { key: KEY_WITH_ENCODING }) },
+    { name: '200 body that is not JSON', respond: (url) => new Response(`oops ${url}`, { status: 200 }) },
+    { name: '400 text/plain quoting the request URL', status: 400, respond: (url) => new Response(`Bad request: ${url}`, { status: 400, headers: { 'content-type': 'text/plain' } }) },
+    { name: '400 JSON error quoting the key', status: 400, respond: () => jsonResponse(400, { error: `Invalid API key ${KEY_WITH_ENCODING}` }) },
+    { name: '500 JSON with a status field', status: 500, respond: () => jsonResponse(500, { status: 'error', message: `Internal error for ${KEY_WITH_ENCODING}` }) },
+    { name: '429 problem JSON with a numeric status', status: 429, respond: (url) => jsonResponse(429, { status: 429, title: 'Too Many Requests', detail: url }) },
+    { name: '403 JSON with a validation-looking status', status: 403, respond: () => jsonResponse(403, { status: 'invalid', error: 'Forbidden' }) },
+    { name: '503 HTML page', status: 503, respond: (url) => new Response(`<html><title>Down</title>${url}</html>`, { status: 503, headers: { 'content-type': 'text/html' } }) },
+    { name: '302 redirect', status: 302, respond: (url) => new Response(null, { status: 302, headers: { location: `https://elsewhere.example/?from=${encodeURIComponent(url)}` } }) },
+    { name: 'transport error quoting the request URL', respond: (url) => { throw new TypeError(`fetch failed for ${url} (${KEY_WITH_ENCODING})`); } },
+];
+
+function jsonResponse(status, body) {
+    return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+function recordingKv() {
+    const puts = [];
+    return { puts, LOGS: { put: async (key, value) => { puts.push({ key, value }); } } };
+}
+
+for (const mode of FAILURE_MODES) {
+    test(`fails open and keeps the key out of KV and the logs: ${mode.name}`, async () => {
+        const kv = recordingKv();
+        const { context, calls, errors, logs } = loadWorker({ API_KEY: KEY_WITH_ENCODING, VALID_STATUS: ['valid'], LOGS: kv.LOGS });
+        context.fetch = async (input) => {
+            if (input instanceof Request) {
+                calls.forwarded.push(input);
+                return new Response('origin response');
+            }
+            return mode.respond(String(input));
+        };
+
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+
+        // Fail open: the submission reaches the origin unvalidated, never rewritten to INVALID.
+        assert.strictEqual(calls.forwarded.length, 1);
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+
+        // ... and the failure is logged as one, naming the HTTP status where there is one.
+        assert.ok(errors.some((line) => line.startsWith('ZeroBounce validation failed')), `expected an error log line, got ${JSON.stringify(errors)}`);
+        if (mode.status) {
+            assert.ok(errors.some((line) => line.includes(`HTTP ${mode.status}`)), `expected HTTP ${mode.status} in ${JSON.stringify(errors)}`);
+        }
+
+        // What is stored in KV is the failure payload, not the API's raw body.
+        assert.strictEqual(kv.puts.length, 1);
+        const stored = JSON.parse(JSON.parse(kv.puts[0].value));
+        assert.deepStrictEqual(Object.keys(stored).sort(), ['error', 'message']);
+
+        const encoded = encodeURIComponent(KEY_WITH_ENCODING);
+        for (const text of [...kv.puts.map((p) => p.key + p.value), ...errors, ...logs]) {
+            assert.ok(!text.includes(KEY_WITH_ENCODING), `the raw key leaked: ${text}`);
+            assert.ok(!text.includes(encoded), `the encoded key leaked: ${text}`);
+        }
+    });
+}
+
+test('a non-2xx answer is an API error even when its body has a validation status', async () => {
+    const { context, errors } = loadWorker({ API_KEY }, { });
+    context.fetch = async () => jsonResponse(500, { status: 'invalid', message: 'Internal' });
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.strictEqual(typeof result, 'string', 'a failure payload, not a validation result');
+    assert.deepStrictEqual(JSON.parse(result), { error: 'HTTP 500', message: 'Internal' });
+    assert.ok(errors.some((line) => line.includes('HTTP 500') && line.includes('Internal')));
+});
+
+test('a validation result is stored in KV with the key redacted wherever it appears', async () => {
+    const kv = recordingKv();
+    const { context } = loadWorker(
+        { API_KEY: KEY_WITH_ENCODING, VALID_STATUS: ['valid'], LOGS: kv.LOGS },
+        { validationResponse: { status: 'valid', address: 'test@example.com', note: `seen ${KEY_WITH_ENCODING}` } }
+    );
+
+    await context.handleRequest(fetchEvent(formRequest('email=test%40example.com')));
+
+    assert.strictEqual(kv.puts.length, 1);
+    const stored = JSON.parse(kv.puts[0].value);
+    assert.strictEqual(stored.status, 'valid');
+    assert.strictEqual(stored.note, 'seen ***');
+});

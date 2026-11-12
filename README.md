@@ -37,10 +37,12 @@ binding is optional: when one is missing the Worker falls back to forwarding the
 ### When validation fails
 
 The Worker fails open: if the validation request cannot produce a status (an invalid or drained API key, a timeout, a
-network error, a redirect, or any other API error), the submission is forwarded to your origin unvalidated, exactly as
-if the Worker were not there. Each such failure is logged with `console.error` (visible in Workers Logs and
-`wrangler tail`), naming the cause and the API's own message, so a dead key does not go unnoticed. The API key itself is
-never logged. The validation request does not follow redirects, since its URL carries the key.
+network error, a redirect, any non-2xx answer whatever its body says, or any other API error), the submission is
+forwarded to your origin unvalidated, exactly as if the Worker were not there. Each such failure is logged with
+`console.error` (visible in Workers Logs and `wrangler tail`), naming the cause and the API's own message, so a dead key
+does not go unnoticed; when `LOGS` is bound, the same `{"error": ..., "message": ...}` failure is stored there instead of
+the API's raw answer. The API key itself is never logged or stored. The validation request does not follow redirects,
+since its URL carries the key.
 
 The Worker logs which address it validated and the result, but never a submitted form body, which can hold passwords.
 

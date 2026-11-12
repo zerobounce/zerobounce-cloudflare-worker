@@ -226,8 +226,9 @@ function logValidation(event, email, url, result) {
         const d = new Date();
 
         // The waitUntil function allows us to continue performing work in our Cloudflare Worker, without blocking.
+        // Every string is redacted before it is stored, so the API key never reaches KV.
         event.waitUntil(LOGS.put(`{${pad(d.getFullYear(),4)}-${pad(d.getMonth()+1)}-${pad(d.getDate())}}-{${email}}-{${url}}-{${pad(d.getHours())}:${pad(d.getMinutes())}}-${pad(d.getSeconds())}.${pad(d.getMilliseconds(),3)}`,
-            JSON.stringify(result)));
+            JSON.stringify(result, (key, value) => (typeof value === 'string' ? redactKey(value) : value))));
     }
 }
 
@@ -332,16 +333,16 @@ function validationFailure(name, message) {
  * The API's own error text when a body carries no validation result. LIVE: an
  * invalid or drained key gets an HTTP 200 with {"error": "..."} and no status.
  */
-function apiErrorText(data) {
+function apiErrorText(data, fallback = 'ZeroBounce returned no validation status.') {
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
         return 'ZeroBounce returned an unexpected response.';
     }
-    for (const key of ['error', 'error_message', 'Error', 'message', 'Message']) {
+    for (const key of ['error', 'error_message', 'Error', 'message', 'Message', 'detail']) {
         if (typeof data[key] === 'string' && data[key].trim()) {
             return data[key].trim();
         }
     }
-    return 'ZeroBounce returned no validation status.';
+    return fallback;
 }
 
 /**
@@ -381,12 +382,27 @@ async function validateEmail(email, ip_address) {
                 return validationFailure('Redirect', `ZeroBounce answered with a redirect (HTTP ${resp.status}), which this Worker does not follow`);
             }
 
+            if (resp.status < 200 || resp.status >= 300) {
+                // Any other non-2xx answer is an API error, whatever its body
+                // says: a 500 {"status":"error"} or a 429 {"status":429} is not
+                // a validation result and must not reject the address.
+                const fallback = `ZeroBounce answered with HTTP ${resp.status}`;
+                let body = null;
+                try {
+                    body = JSON.parse(await resp.text());
+                } catch (err) {
+                    // Not JSON (an HTML error page, plain text, or an empty body).
+                }
+                return validationFailure(`HTTP ${resp.status}`, body && typeof body === 'object' ? apiErrorText(body, fallback) : fallback);
+            }
+
             const data = await resp.json();
 
             if (!data || typeof data !== 'object' || !Object.prototype.hasOwnProperty.call(data, 'status')) {
-                // A dead or invalid key, or another API error, on any HTTP status.
-                const failure = validationFailure(`HTTP ${resp.status}`, apiErrorText(data));
-                return data && typeof data === 'object' ? data : failure;
+                // A dead or invalid key, or another API error, on a 2xx status.
+                // The redacted failure is returned (and stored in KV), never the
+                // raw body, which can quote the request URL and so the key.
+                return validationFailure(`HTTP ${resp.status}`, apiErrorText(data));
             }
 
             return data;
