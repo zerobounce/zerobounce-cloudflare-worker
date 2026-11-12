@@ -402,6 +402,37 @@ test('a dead key is logged as an error and the submission is forwarded unvalidat
     assert.ok(errors.every((line) => !line.includes(API_KEY)), 'the API key must not be logged');
 });
 
+for (const [name, body] of [
+    ['an error string beside a status', { status: 'unknown', error: 'Invalid API key or your account ran out of credits' }],
+    ['an error_message beside a status', { status: 'invalid', error_message: 'Invalid API key' }],
+    ['an Error beside a status', { status: 'invalid', Error: 'Invalid API key' }],
+    ['success false beside a status', { success: false, status: 'error', message: 'Invalid API key' }],
+    ['success "false" beside a status', { success: 'false', status: 'invalid', message: 'Invalid API key' }],
+    ['success "False" beside a status', { success: 'False', status: 'invalid', message: 'Invalid API key' }],
+]) {
+    test(`a 2xx with ${name} is an API error: logged, and the address is forwarded unchanged`, async () => {
+        const { context, calls, errors } = loadWorker(
+            { API_KEY, VALID_STATUS: ['valid'] },
+            { validationResponse: body }
+        );
+
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+
+        assert.strictEqual(calls.validation.length, 1);
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+        assert.ok(errors.some((line) => line.includes('Invalid API key')), 'expected the API message in an error log line');
+    });
+}
+
+test('a 2xx validation result with an empty error field is still a result', async () => {
+    const { context } = loadWorker({ API_KEY }, { validationResponse: { status: 'invalid', error: '', success: true } });
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.strictEqual(typeof result, 'object');
+    assert.strictEqual(result.status, 'invalid');
+});
+
 test('ip_address is left out when the CF-Connecting-IP header is missing', async () => {
     const { context, calls } = loadWorker({ API_KEY });
 
@@ -684,6 +715,27 @@ test('an error message carrying the API key is redacted in the log and in the re
         assert.ok(!text.includes(encoded), `the encoded key leaked: ${text}`);
     }
     assert.match(JSON.parse(result).message, /api_key=\*\*\*&email=x/);
+});
+
+test('a JSON-escaped copy of the API key in an error message is redacted in the log and in the returned payload', async () => {
+    // A key with a quote, a slash, a plus and a percent sign: its JSON-escaped
+    // forms differ from the raw and the URL-encoded one.
+    const key = 'test"key/+%1';
+    const json = JSON.stringify(key).slice(1, -1);
+    const forms = [key, encodeURIComponent(key), json, json.replace(/\//g, '\\/')];
+    assert.strictEqual(new Set(forms).size, forms.length);
+    const { context, errors } = loadWorker({ API_KEY: key });
+    // A server quoting a JSON copy of the request inside its error string.
+    context.fetch = async () => jsonResponse(200, { error: `Invalid API key in ${forms.join(' ')}` });
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.ok(errors.length > 0, 'expected an error log line');
+    for (const text of [JSON.parse(result).message, ...errors]) {
+        for (const form of forms) {
+            assert.ok(!text.includes(form), `the key leaked as ${form}: ${text}`);
+        }
+    }
 });
 
 // ---------------------------------------------------------------------------

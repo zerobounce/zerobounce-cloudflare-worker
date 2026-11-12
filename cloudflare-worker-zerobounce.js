@@ -313,7 +313,14 @@ function redactKey(text) {
     if (typeof API_KEY === 'undefined' || !API_KEY) {
         return value;
     }
-    return value.split(String(API_KEY)).join('***').split(encodeURIComponent(String(API_KEY))).join('***');
+    const key = String(API_KEY);
+    // Raw, URL-encoded, and JSON-escaped (with and without "/" escaped as
+    // "\/"), as a body quoting a JSON copy of the key would carry it. Longest
+    // first, so no form leaves part of a longer one behind.
+    const json = JSON.stringify(key).slice(1, -1);
+    const forms = [...new Set([key, encodeURIComponent(key), json, json.replace(/\//g, '\\/')])]
+        .sort((a, b) => b.length - a.length);
+    return forms.reduce((text, form) => text.split(form).join('***'), value);
 }
 
 /**
@@ -343,6 +350,20 @@ function apiErrorText(data, fallback = 'ZeroBounce returned no validation status
         }
     }
     return fallback;
+}
+
+/**
+ * Whether a 2xx body is an API error even though it carries a status: a
+ * success of false (also as the string "false" or "False"), or a non-empty
+ * error, error_message or Error string. A validation result has neither.
+ */
+function isApiErrorBody(data) {
+    if (data.success === false || data.success === 'false' || data.success === 'False') {
+        return true;
+    }
+    return ['error', 'error_message', 'Error'].some(
+        (key) => typeof data[key] === 'string' && data[key].trim() !== ''
+    );
 }
 
 /**
@@ -398,8 +419,15 @@ async function validateEmail(email, ip_address) {
 
             const data = await resp.json();
 
-            if (!data || typeof data !== 'object' || !Object.prototype.hasOwnProperty.call(data, 'status')) {
-                // A dead or invalid key, or another API error, on a 2xx status.
+            if (
+                !data ||
+                typeof data !== 'object' ||
+                !Object.prototype.hasOwnProperty.call(data, 'status') ||
+                isApiErrorBody(data)
+            ) {
+                // A dead or invalid key, or another API error, on a 2xx status,
+                // even one that also carries a status: it is not a validation
+                // result, so the address is not rewritten (fail open).
                 // The redacted failure is returned (and stored in KV), never the
                 // raw body, which can quote the request URL and so the key.
                 return validationFailure(`HTTP ${resp.status}`, apiErrorText(data));
