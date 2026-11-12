@@ -521,3 +521,167 @@ test('an API_KEY with whitespace or control characters is refused and logged, an
         assert.ok(errors.every((line) => !line.includes(API_KEY)), 'the API key must not be logged');
     }
 });
+
+// ---------------------------------------------------------------------------
+// Multipart bodies reach the origin byte for byte
+// ---------------------------------------------------------------------------
+
+/** Bytes that are not valid UTF-8 (a JPEG header and stray continuation bytes). */
+const BINARY_FILE = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x80, 0x81, 0xfe, 0xc0, 0x0d, 0x0a, 0xc3]);
+
+function concatBytes(...parts) {
+    const chunks = parts.map((part) => (typeof part === 'string' ? new TextEncoder().encode(part) : part));
+    const out = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
+}
+
+/** A multipart body with an address field between two binary file parts. */
+function multipartWithFiles(boundary, address) {
+    const filePart = (name) => concatBytes(
+        `--${boundary}\r\n`,
+        `Content-Disposition: form-data; name="${name}"; filename="${name}.jpg"\r\n`,
+        'Content-Type: image/jpeg\r\n\r\n',
+        BINARY_FILE,
+        '\r\n'
+    );
+    return concatBytes(
+        filePart('before'),
+        `--${boundary}\r\n`,
+        'Content-Disposition: form-data; name="email"\r\n\r\n',
+        `${address}\r\n`,
+        filePart('after'),
+        `--${boundary}--\r\n`
+    );
+}
+
+function multipartRequest(body, contentType) {
+    return new Request('https://example.com/upload', {
+        method: 'POST',
+        headers: { 'content-type': contentType, 'CF-Connecting-IP': '198.51.100.7' },
+        body,
+    });
+}
+
+test('a multipart body with binary file parts is forwarded byte for byte when the address is accepted', async () => {
+    const boundary = '----zbtestboundary';
+    const sent = multipartWithFiles(boundary, 'person@example.com');
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'valid' } });
+
+    await context.handleRequest(fetchEvent(multipartRequest(sent, `multipart/form-data; boundary=${boundary}`)));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'person@example.com');
+    assert.deepStrictEqual(new Uint8Array(await calls.forwarded[0].arrayBuffer()), sent);
+});
+
+test('a rejected multipart address becomes INVALID and the binary file parts are untouched', async () => {
+    const boundary = '----zbtestboundary';
+    const sent = multipartWithFiles(boundary, 'person@example.com');
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(multipartRequest(sent, `multipart/form-data; boundary=${boundary}`)));
+
+    assert.strictEqual(calls.validation.length, 1);
+    const forwarded = new Uint8Array(await calls.forwarded[0].arrayBuffer());
+    assert.deepStrictEqual(forwarded, multipartWithFiles(boundary, 'INVALID'));
+    assert.strictEqual(calls.forwarded[0].headers.get('content-type'), `multipart/form-data; boundary=${boundary}`);
+});
+
+test('an address inside a file part is neither validated nor rewritten', async () => {
+    const boundary = 'zb';
+    const sent = concatBytes(
+        `--${boundary}\r\n`,
+        'Content-Disposition: form-data; name="upload"; filename="contacts.txt"\r\n',
+        'Content-Type: text/plain; charset="utf-8"\r\n\r\n',
+        'someone@example.com\r\n',
+        `--${boundary}--\r\n`
+    );
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(multipartRequest(sent, `multipart/form-data; boundary=${boundary}`)));
+
+    assert.strictEqual(calls.validation.length, 0);
+    assert.deepStrictEqual(new Uint8Array(await calls.forwarded[0].arrayBuffer()), sent);
+});
+
+// ---------------------------------------------------------------------------
+// Content-Type is matched on its media type, not on the exact header text
+// ---------------------------------------------------------------------------
+
+test('a URL-encoded form is validated whatever the case of its media type and whatever its parameters', async () => {
+    for (const contentType of [
+        'application/x-www-form-urlencoded',
+        'application/x-www-form-urlencoded; charset=UTF-8',
+        'Application/X-WWW-Form-URLEncoded;charset=utf-8',
+    ]) {
+        const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+        await context.handleRequest(fetchEvent(formRequest('name=A&email=bad%40example.com', { headers: { 'content-type': contentType } })));
+
+        assert.strictEqual(calls.validation.length, 1, contentType);
+        assert.strictEqual(await calls.forwarded[0].text(), 'name=A&email=INVALID', contentType);
+    }
+});
+
+test('a multipart form is validated whatever the case of its media type and however its boundary is written', async () => {
+    const boundary = 'zb-boundary';
+    for (const contentType of [
+        `multipart/form-data; boundary=${boundary}`,
+        `Multipart/Form-Data; Boundary="${boundary}"`,
+        `multipart/form-data;charset=UTF-8;boundary=${boundary}`,
+    ]) {
+        const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+        await context.handleRequest(fetchEvent(multipartRequest(multipartWithFiles(boundary, 'person@example.com'), contentType)));
+
+        assert.strictEqual(calls.validation.length, 1, contentType);
+        assert.deepStrictEqual(new Uint8Array(await calls.forwarded[0].arrayBuffer()), multipartWithFiles(boundary, 'INVALID'), contentType);
+    }
+});
+
+test('a media type that merely contains a form type is not treated as one', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(formRequest('email=bad%40example.com', { headers: { 'content-type': 'text/plain; note="application/x-www-form-urlencoded"' } })));
+
+    assert.strictEqual(calls.validation.length, 0);
+    assert.strictEqual(await calls.forwarded[0].text(), 'email=bad%40example.com');
+});
+
+// ---------------------------------------------------------------------------
+// Field selection and key redaction
+// ---------------------------------------------------------------------------
+
+test('a your-email field is validated ahead of an earlier field that also holds an address', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+
+    await context.handleRequest(fetchEvent(formRequest('contact=other%40example.com&your-email=bad%40example.com')));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'bad@example.com');
+    assert.strictEqual(await calls.forwarded[0].text(), 'contact=other%40example.com&your-email=INVALID');
+});
+
+test('an error message carrying the API key is redacted in the log and in the returned payload', async () => {
+    // A key with characters that URL encoding changes, so both forms are checked.
+    const key = 'test/key+placeholder=1';
+    const encoded = encodeURIComponent(key);
+    const { context, errors } = loadWorker({ API_KEY: key });
+    context.fetch = async () => {
+        throw new TypeError(`fetch failed: key ${key} in https://api.zerobounce.net/v2/validate?api_key=${encoded}&email=x`);
+    };
+
+    const result = await context.validateEmail('test@example.com', '198.51.100.7');
+
+    assert.ok(errors.length > 0, 'expected an error log line');
+    for (const text of [result, ...errors]) {
+        assert.ok(!text.includes(key), `the raw key leaked: ${text}`);
+        assert.ok(!text.includes(encoded), `the encoded key leaked: ${text}`);
+    }
+    assert.match(JSON.parse(result).message, /api_key=\*\*\*&email=x/);
+});

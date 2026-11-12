@@ -51,6 +51,14 @@ first field whose value is an email address. When the status is outside `VALID_S
 any repeat of it) is replaced by `INVALID`. Every other byte of the body reaches your origin exactly as it was sent,
 including its percent-encoding.
 
+In a multipart form the Worker validates the first address it finds in a field that is not a file upload. When the
+status is outside `VALID_STATUS`, that address is replaced by `INVALID`; every other byte, including uploaded files,
+reaches your origin exactly as it was sent. File parts are never searched or changed.
+
+Forms are recognised by their media type, in any letter case and with any parameters, so
+`application/x-www-form-urlencoded; charset=UTF-8` (what jQuery sends) is validated like
+`application/x-www-form-urlencoded`.
+
 ### Choosing a region
 
 ZeroBounce serves the real-time validation API from three interchangeable hosts. `api.zerobounce.net` is the global
