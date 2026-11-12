@@ -896,3 +896,175 @@ test('a validation result is stored in KV with the key redacted wherever it appe
     assert.strictEqual(stored.status, 'valid');
     assert.strictEqual(stored.note, 'seen ***');
 });
+
+// ---------------------------------------------------------------------------
+// Strict JSON (check E7): the shared corpus
+// ---------------------------------------------------------------------------
+
+/**
+ * tests/fixtures/strict-json-corpus.tsv is a byte-identical copy of
+ * sdk-docs/skills/zerobounce-sdk/references/strict-json-corpus.tsv in
+ * zerobounce/sdk-docs: copy it over, never edit it here. Each line is
+ * VERDICT<TAB>"JSON-encoded body"; "#" lines are comments.
+ */
+function strictJsonCorpus() {
+    const text = fs.readFileSync(path.join(__dirname, 'fixtures', 'strict-json-corpus.tsv'), 'utf8');
+    const corpus = { REJECT: [], ACCEPT: [] };
+    for (const line of text.split('\n')) {
+        if (!line.trim() || line.startsWith('#')) continue;
+        const tab = line.indexOf('\t');
+        const verdict = line.slice(0, tab);
+        assert.ok(verdict in corpus, `unknown verdict ${verdict}`);
+        corpus[verdict].push(JSON.parse(line.slice(tab + 1)));
+    }
+    return corpus;
+}
+
+test('every REJECT body of the strict JSON corpus is a "not JSON" failure with HTTP 200, and every ACCEPT body parses', async () => {
+    const corpus = strictJsonCorpus();
+    assert.ok(corpus.REJECT.length > 30 && corpus.ACCEPT.length > 5);
+    const { context } = loadWorker({ API_KEY });
+    const notJson = { error: 'HTTP 200', message: 'ZeroBounce returned a response that is not JSON' };
+    const wrong = [];
+    for (const [verdict, bodies] of Object.entries(corpus)) {
+        for (const body of bodies) {
+            context.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+            const result = await context.validateEmail('test@example.com', '198.51.100.7');
+            const rejected = typeof result === 'string' && JSON.stringify(JSON.parse(result)) === JSON.stringify(notJson);
+            if (rejected !== (verdict === 'REJECT')) {
+                wrong.push(`${verdict} ${JSON.stringify(body)}: ${typeof result === 'string' ? result : JSON.stringify(result)}`);
+            }
+        }
+    }
+    assert.deepStrictEqual(wrong, []);
+});
+
+// ---------------------------------------------------------------------------
+// Redaction closed under encoding (checks S4/S7)
+// ---------------------------------------------------------------------------
+
+/**
+ * A key echoed through any sequence of up to three encodings (URL with %20,
+ * URL with "+", JSON, JSON with "/" as "\/") never reaches the logs, KV or the
+ * returned payload in any decoded view. The Worker refuses a key with
+ * whitespace, so the key carries every other awkward character.
+ */
+const FUZZ_ENCODINGS = {
+    'URL %20': (text) => encodeURIComponent(text),
+    'URL +': (text) => new URLSearchParams({ s: text }).toString().slice(2),
+    JSON: (text) => JSON.stringify(text).slice(1, -1),
+    'JSON \\/': (text) => JSON.stringify(text).slice(1, -1).split('/').join('\\/'),
+};
+
+function encodingSequences() {
+    let layer = [[[], (text) => text]];
+    const all = [];
+    for (let depth = 0; depth < 3; depth++) {
+        layer = layer.flatMap(([names, encode]) =>
+            Object.entries(FUZZ_ENCODINGS).map(([name, step]) => [[...names, name], (text) => step(encode(text))]));
+        all.push(...layer);
+    }
+    return all.map(([names, encode]) => [names.join(' > '), encode]);
+}
+
+/** Decoders written independently of the Worker's: whole-string where the platform allows. */
+function decodedViews(text) {
+    const decoders = [
+        (t) => { try { return decodeURIComponent(t); } catch (err) { return unescape(t); } },
+        (t) => { const s = t.replace(/\+/g, ' '); try { return decodeURIComponent(s); } catch (err) { return unescape(s); } },
+        (t) => {
+            try {
+                return JSON.parse(`"${t}"`);
+            } catch (err) {
+                return t.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))).replace(/\\(["\\/])/g, '$1');
+            }
+        },
+    ];
+    const seen = new Set([text]);
+    let layer = [text];
+    for (let i = 0; i < 3; i++) {
+        layer = layer.flatMap((view) => decoders.map((decode) => decode(view))).filter((view) => !seen.has(view) && seen.add(view));
+    }
+    return [...seen];
+}
+
+/** Keys shuffled by a seeded generator (mulberry32), so a failure reproduces. */
+function fuzzKeys() {
+    let state = 20261112;
+    const random = () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let t = state;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const keys = [`key"/+%&=<>'\\z`];
+    for (let i = 0; i < 2; i++) {
+        const chars = [...`"/\\+%&=<>'`, ...'Ab3xQ9'];
+        for (let j = chars.length - 1; j > 0; j--) {
+            const k = Math.floor(random() * (j + 1));
+            [chars[j], chars[k]] = [chars[k], chars[j]];
+        }
+        keys.push(`k${chars.join('')}z`);
+    }
+    return keys;
+}
+
+const FUZZ_SHAPES = {
+    '200 JSON error': (echo) => jsonResponse(200, { error: `Invalid API key ${echo}` }),
+    '200 success false': (echo) => jsonResponse(200, { success: false, message: `Rejected ${echo}` }),
+    '400 text': (echo) => new Response(`Bad Request: [${echo}]`, { status: 400, headers: { 'content-type': 'text/plain' } }),
+    '500 JSON error': (echo) => jsonResponse(500, { error: `failed for ${echo}` }),
+    '200 result quoting the key': (echo) => jsonResponse(200, { status: 'valid', note: `seen ${echo}` }),
+    'transport error': (echo) => { throw new TypeError(`fetch failed: ${echo}`); },
+};
+
+test('the API key never reaches the logs, KV or the payload in any decoded view, through any sequence of up to three encodings', async () => {
+    const sequences = encodingSequences();
+    assert.strictEqual(sequences.length, 4 + 16 + 64);
+    const leaks = [];
+    for (const key of fuzzKeys()) {
+        for (const [sequence, encode] of sequences) {
+            assert.ok(decodedViews(encode(key)).includes(key), `the test cannot decode ${sequence}`);
+            for (const [shape, respond] of Object.entries(FUZZ_SHAPES)) {
+                const kv = recordingKv();
+                const { context, errors, logs } = loadWorker({ API_KEY: key, VALID_STATUS: ['valid'], LOGS: kv.LOGS });
+                context.fetch = async (input) => (input instanceof Request ? new Response('origin response') : respond(encode(key)));
+                await context.handleRequest(fetchEvent(formRequest('email=test%40example.com')));
+                assert.strictEqual(kv.puts.length, 1, `${shape} / ${sequence}: nothing stored`);
+                const texts = [...kv.puts.map((p) => p.key + p.value), ...errors, ...logs];
+                if (texts.some((text) => decodedViews(text).some((view) => view.includes(key)))) {
+                    leaks.push(`${shape} / ${sequence}`);
+                }
+            }
+        }
+    }
+    assert.deepStrictEqual(leaks, []);
+});
+
+test('the API key is also caught through \\uXXXX escapes and URL encoding that keeps "+"', async () => {
+    // PHP's json_encode (JSON_HEX_*) and Python's ensure_ascii write <
+    // and friends; escape() and some URL encoders leave "+" as it is, so "+"
+    // must not be read as a space there.
+    const unicodeEscaped = (text) => [...text].map((char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`).join('');
+    const plusKept = (text) => encodeURIComponent(text).split('%2B').join('+');
+    const sequences = {
+        '\\u escapes': unicodeEscaped,
+        '\\u escapes > URL %20': (text) => encodeURIComponent(unicodeEscaped(text)),
+        'URL keeping + > URL keeping +': (text) => plusKept(plusKept(text)),
+        'escape() > escape()': (text) => escape(escape(text)),
+    };
+    const leaks = [];
+    for (const key of fuzzKeys()) {
+        for (const [sequence, encode] of Object.entries(sequences)) {
+            assert.ok(decodedViews(encode(key)).includes(key), `the test cannot decode ${sequence}`);
+            const { context, errors } = loadWorker({ API_KEY: key });
+            context.fetch = async () => jsonResponse(200, { error: `Invalid API key [${encode(key)}]` });
+            const result = await context.validateEmail('test@example.com', '198.51.100.7');
+            if ([result, ...errors].some((text) => decodedViews(text).some((view) => view.includes(key)))) {
+                leaks.push(sequence);
+            }
+        }
+    }
+    assert.deepStrictEqual(leaks, []);
+});

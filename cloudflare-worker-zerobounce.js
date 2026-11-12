@@ -307,7 +307,63 @@ function apiTimeout() {
     return DEFAULT_API_TIMEOUT_MS;
 }
 
-/** Removes the API key from text that is about to be logged or stored. */
+/** What is logged or stored instead of a text whose decoded views still hold the key. */
+const CREDENTIAL_OMITTED_MESSAGE = 'the response text was omitted because it contained a credential';
+
+/** %XX sequences decoded as UTF-8; a sequence that is not valid UTF-8 stays as it is. */
+function percentDecoded(text) {
+    return text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+        try {
+            return decodeURIComponent(run);
+        } catch (err) {
+            return run.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+        }
+    });
+}
+
+const JSON_UNESCAPES = { '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+
+/** Each JSON string escape (\" \\ \/ \b \f \n \r \t \uXXXX) decoded, in one left-to-right pass. */
+function jsonUnescaped(text) {
+    return text.replace(/\\(?:u([0-9A-Fa-f]{4})|(["\\/bfnrt]))/g, (_, hex, simple) =>
+        hex ? String.fromCharCode(parseInt(hex, 16)) : JSON_UNESCAPES[simple]
+    );
+}
+
+/**
+ * Whether any view of the text reached by up to three decodings, in any
+ * order, contains the key: URL (%XX), form ("+" as a space, then %XX) and JSON.
+ */
+function holdsKey(text, key) {
+    const decoders = [percentDecoded, (view) => percentDecoded(view.split('+').join(' ')), jsonUnescaped];
+    const views = new Set([text]);
+    let layer = [text];
+    for (let depth = 0; depth < 3; depth++) {
+        const next = [];
+        for (const view of layer) {
+            for (const decode of decoders) {
+                const decoded = decode(view);
+                if (!views.has(decoded)) {
+                    views.add(decoded);
+                    next.push(decoded);
+                }
+            }
+        }
+        layer = next;
+    }
+    for (const view of views) {
+        if (view.includes(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Removes the API key from text that is about to be logged or stored. A text
+ * that still holds the key in a spelling the list below misses (it decodes to
+ * the key) is replaced as a whole with a fixed message.
+ */
 function redactKey(text) {
     const value = String(text);
     if (typeof API_KEY === 'undefined' || !API_KEY) {
@@ -323,7 +379,8 @@ function redactKey(text) {
     // leaves part of a longer one behind.
     const quotings = [
         (text) => JSON.stringify(text).slice(1, -1),
-        (text) => JSON.stringify(text).slice(1, -1).replace(/\//g, '\\/'),
+        // JSON.stringify has already escaped every backslash, so "/" as "\/" completes it.
+        (text) => JSON.stringify(text).slice(1, -1).split('/').join('\\/'),
     ];
     const encodings = [
         (text) => text,
@@ -339,7 +396,8 @@ function redactKey(text) {
     }
     const forms = [...new Set(quoted.flatMap((text) => encodings.map((encode) => encode(text))))]
         .sort((a, b) => b.length - a.length);
-    return forms.reduce((text, form) => text.split(form).join('***'), value);
+    const redacted = forms.reduce((text, form) => text.split(form).join('***'), value);
+    return holdsKey(redacted, key) ? CREDENTIAL_OMITTED_MESSAGE : redacted;
 }
 
 /**
@@ -443,7 +501,9 @@ async function validateEmail(email, ip_address) {
             }
 
             // A body cut short throws here, as the transport error it is.
-            const text = await resp.text();
+            // resp.text() would drop a leading byte order mark, which is not
+            // JSON (RFC 8259), so the bytes are decoded with the mark kept.
+            const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(await resp.arrayBuffer());
             let data;
             try {
                 data = JSON.parse(text);
