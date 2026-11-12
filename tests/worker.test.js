@@ -1068,3 +1068,96 @@ test('the API key is also caught through \\uXXXX escapes and URL encoding that k
     }
     assert.deepStrictEqual(leaks, []);
 });
+
+// ---------------------------------------------------------------------------
+// Round-13 guards: JSON depth limit, wrong shape, and each decode step
+// ---------------------------------------------------------------------------
+
+test('a body nested deeper than the JSON depth limit is a failure with HTTP 200, and the submission is forwarded', async () => {
+    const deep = 200000;
+    const nested = (depth) => `{"status":"valid","a":${'['.repeat(depth - 1)}${']'.repeat(depth - 1)}}`;
+    const tooDeep = { error: 'HTTP 200', message: 'ZeroBounce returned a response nested too deeply to read' };
+    for (const body of ['['.repeat(deep) + ']'.repeat(deep), '['.repeat(deep), nested(deep), nested(513)]) {
+        const kv = recordingKv();
+        const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'], LOGS: kv.LOGS });
+        context.fetch = async (input) => (input instanceof Request
+            ? (calls.forwarded.push(input), new Response('origin response'))
+            : new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }));
+        const result = await context.validateEmail('test@example.com', '198.51.100.7');
+        assert.deepStrictEqual(JSON.parse(result), tooDeep);
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com')));
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com');
+        assert.strictEqual(kv.puts.length, 1);
+    }
+    // At the limit, and with brackets only inside a string, it is still a result.
+    for (const body of [nested(512), `{"status":"valid","a":"${'['.repeat(deep)}"}`]) {
+        const { context } = loadWorker({ API_KEY });
+        context.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+        const result = await context.validateEmail('test@example.com', '198.51.100.7');
+        assert.strictEqual(result.status, 'valid');
+    }
+});
+
+test('strict JSON of the wrong shape on a 2xx is a failure with HTTP 200, never a result (E7)', async () => {
+    for (const body of ['0', '"x"', 'true', 'null', '[]', '[{"status":"valid"}]', '{}', '{"address":"a@example.com"}']) {
+        const { context } = loadWorker({ API_KEY });
+        context.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+        const result = await context.validateEmail('test@example.com', '198.51.100.7');
+        assert.strictEqual(typeof result, 'string', body);
+        assert.strictEqual(JSON.parse(result).error, 'HTTP 200', body);
+    }
+});
+
+const NON_ASCII_KEY = 'käy-Sécret-\u{1F600}';
+const percentAll = (text, lower = false) => [...Buffer.from(text, 'utf8')]
+    .map((byte) => `%${byte.toString(16).padStart(2, '0')}`)
+    .map((pct) => (lower ? pct : pct.toUpperCase()))
+    .join('');
+const unicodeAll = (text) => [...text].flatMap((char) => (char.length === 2 ? [char[0], char[1]] : [char]))
+    .map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, '0')}`)
+    .join('');
+
+function assertHeld(key, echo) {
+    const { context } = loadWorker({ API_KEY: key });
+    assert.strictEqual(context.holdsKey(`Bad Request: [${echo}]`, key), true, echo);
+    assert.strictEqual(context.redactKey(`Bad Request: [${echo}]`).includes('Bad Request'), false, echo);
+}
+
+test('the decode check reads %XX in upper- and lower-case hex', () => {
+    for (const key of [API_KEY, NON_ASCII_KEY]) {
+        assertHeld(key, percentAll(key));
+        assertHeld(key, percentAll(key, true));
+    }
+});
+
+test('the decode check reads a %XX run that is not valid UTF-8 as a whole, one sequence at a time', () => {
+    for (const junk of ['%FF', '%ff', '%C3', '%80', '%E4', '%F0%9F', '%ED%A0%80']) {
+        for (const key of [API_KEY, NON_ASCII_KEY]) {
+            assertHeld(key, `${junk}${percentAll(key)}`);
+            assertHeld(key, `${percentAll(key)}${junk}`);
+        }
+    }
+    const { context } = loadWorker({ API_KEY });
+    assert.strictEqual(context.redactKey('Bad Request: [%FF%41%C3 %e4]'), 'Bad Request: [%FF%41%C3 %e4]');
+});
+
+test('the decode check reads "+" as a space, JSON escapes and \\uXXXX with surrogate pairs', () => {
+    assertHeld('k ey-z', percentAll('k ey-z').split('%20').join('+'));
+    assertHeld(NON_ASCII_KEY, unicodeAll(NON_ASCII_KEY));
+    assertHeld('a"b\\c/d', '\\u0061\\"\\u0062\\\\\\u0063\\/\\u0064');
+});
+
+test('a NUL or %00 in the body does not end the decode check', () => {
+    assertHeld(API_KEY, `\u0000${percentAll(API_KEY)}`);
+    assertHeld(API_KEY, `%00${percentAll(API_KEY)}`);
+    assertHeld(API_KEY, `\\u0000${unicodeAll(API_KEY)}`);
+});
+
+test('the decode check covers four layers: the request encoding plus three echo layers', () => {
+    const key = 'k%e+y/"z';
+    let echo = key;
+    for (let i = 0; i < 4; i++) echo = encodeURIComponent(echo);
+    assertHeld(key, echo);
+    const json = (text) => JSON.stringify(text).slice(1, -1);
+    assertHeld(key, encodeURIComponent(json(encodeURIComponent(json(key)))));
+});

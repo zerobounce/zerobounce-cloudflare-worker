@@ -310,13 +310,49 @@ function apiTimeout() {
 /** What is logged or stored instead of a text whose decoded views still hold the key. */
 const CREDENTIAL_OMITTED_MESSAGE = 'the response text was omitted because it contained a credential';
 
-/** %XX sequences decoded as UTF-8; a sequence that is not valid UTF-8 stays as it is. */
+/** The UTF-8 sequence length a lead byte announces, or 0 for a byte no sequence starts with. */
+function utf8SequenceLength(byte) {
+    if (byte < 0x80) return 1;
+    if (byte >= 0xc2 && byte <= 0xdf) return 2;
+    if (byte >= 0xe0 && byte <= 0xef) return 3;
+    if (byte >= 0xf0 && byte <= 0xf4) return 4;
+    return 0;
+}
+
+/**
+ * A run of %XX that is not valid UTF-8 as a whole, decoded one UTF-8 sequence
+ * at a time: each valid sequence becomes its character and each byte that
+ * starts none stays as its %XX, so a stray %FF in front of a percent-encoded
+ * key still leaves the key readable in this view, whatever its characters.
+ */
+function percentRunDecoded(run) {
+    const bytes = run.match(/%[0-9A-Fa-f]{2}/g);
+    let out = '';
+    let i = 0;
+    while (i < bytes.length) {
+        const length = utf8SequenceLength(parseInt(bytes[i].slice(1), 16));
+        if (length) {
+            try {
+                out += decodeURIComponent(bytes.slice(i, i + length).join(''));
+                i += length;
+                continue;
+            } catch (err) {
+                // Not a complete, valid sequence: keep this byte as it is.
+            }
+        }
+        out += bytes[i];
+        i += 1;
+    }
+    return out;
+}
+
+/** %XX sequences decoded as UTF-8; a byte that is not part of valid UTF-8 stays as its %XX. */
 function percentDecoded(text) {
     return text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
         try {
             return decodeURIComponent(run);
         } catch (err) {
-            return run.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+            return percentRunDecoded(run);
         }
     });
 }
@@ -330,15 +366,18 @@ function jsonUnescaped(text) {
     );
 }
 
+/** The Worker's own request encoding plus three echo layers (standard.md §3). */
+const DECODE_LAYERS = 4;
+
 /**
- * Whether any view of the text reached by up to three decodings, in any
+ * Whether any view of the text reached by up to four decodings, in any
  * order, contains the key: URL (%XX), form ("+" as a space, then %XX) and JSON.
  */
 function holdsKey(text, key) {
     const decoders = [percentDecoded, (view) => percentDecoded(view.split('+').join(' ')), jsonUnescaped];
     const views = new Set([text]);
     let layer = [text];
-    for (let depth = 0; depth < 3; depth++) {
+    for (let depth = 0; depth < DECODE_LAYERS; depth++) {
         const next = [];
         for (const view of layer) {
             for (const decode of decoders) {
@@ -398,6 +437,30 @@ function redactKey(text) {
         .sort((a, b) => b.length - a.length);
     const redacted = forms.reduce((text, form) => text.split(form).join('***'), value);
     return holdsKey(redacted, key) ? CREDENTIAL_OMITTED_MESSAGE : redacted;
+}
+
+/** Deeper JSON than any ZeroBounce answer; a body nested past it is refused unparsed. */
+const MAX_JSON_DEPTH = 512;
+
+/** Whether the JSON text nests arrays or objects deeper than MAX_JSON_DEPTH (strings skipped). */
+function jsonNestedTooDeep(text) {
+    let depth = 0;
+    let inString = false;
+    for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        if (inString) {
+            if (char === '\\') i += 1;
+            else if (char === '"') inString = false;
+        } else if (char === '"') {
+            inString = true;
+        } else if (char === '[' || char === '{') {
+            depth += 1;
+            if (depth > MAX_JSON_DEPTH) return true;
+        } else if (char === ']' || char === '}') {
+            depth -= 1;
+        }
+    }
+    return false;
 }
 
 /**
@@ -504,6 +567,10 @@ async function validateEmail(email, ip_address) {
             // resp.text() would drop a leading byte order mark, which is not
             // JSON (RFC 8259), so the bytes are decoded with the mark kept.
             const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(await resp.arrayBuffer());
+            if (jsonNestedTooDeep(text)) {
+                // Storing or logging it would overflow the stack (JSON.stringify).
+                return validationFailure(`HTTP ${resp.status}`, 'ZeroBounce returned a response nested too deeply to read');
+            }
             let data;
             try {
                 data = JSON.parse(text);
