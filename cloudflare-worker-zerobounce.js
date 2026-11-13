@@ -594,6 +594,13 @@ async function validateEmail(email, ip_address) {
                 return validationFailure(`HTTP ${resp.status}`, apiErrorText(data));
             }
 
+            if (typeof data.status !== 'string' || typeof data.address !== 'string') {
+                // Field types are part of the shape: a result has address and
+                // status as strings. A {"status": 1} or {"status": null} is not
+                // a result and must not rewrite the address (fail open).
+                return validationFailure(`HTTP ${resp.status}`, 'ZeroBounce returned a validation result whose address or status is not a string');
+            }
+
             return data;
         } catch (err) {
             // A network error, a timeout, a body cut short, or some other problem.

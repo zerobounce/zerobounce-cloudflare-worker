@@ -29,7 +29,7 @@ const API_KEY = 'test-api-key-placeholder';
  * VALID_STATUS, BYPASS_PATH, ...). The returned object exposes the Worker's
  * top-level functions plus the recorded fetch calls.
  */
-function loadWorker(bindings = {}, { validationResponse = { status: 'valid' }, unbind = [] } = {}) {
+function loadWorker(bindings = {}, { validationResponse = { address: 'test@example.com', status: 'valid' }, unbind = [] } = {}) {
     const calls = { validation: [], forwarded: [] };
     const logs = [];
     const errors = [];
@@ -204,7 +204,7 @@ test('a transport failure is reported as a JSON error payload', async () => {
 test('an allowed status forwards the original body untouched', async () => {
     const { context, calls } = loadWorker(
         { API_KEY, VALID_STATUS: ['valid', 'catch-all'] },
-        { validationResponse: { status: 'valid' } }
+        { validationResponse: { address: 'test@example.com', status: 'valid' } }
     );
 
     await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
@@ -217,7 +217,7 @@ test('an allowed status forwards the original body untouched', async () => {
 test('a status outside the allow-list replaces the address with INVALID', async () => {
     const { context, calls } = loadWorker(
         { API_KEY, VALID_STATUS: ['valid'] },
-        { validationResponse: { status: 'spamtrap' } }
+        { validationResponse: { address: 'test@example.com', status: 'spamtrap' } }
     );
 
     await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
@@ -235,7 +235,7 @@ test('a status outside the allow-list replaces the address with INVALID', async 
 });
 
 test('nothing is rewritten when VALID_STATUS is not bound', async () => {
-    const { context, calls } = loadWorker({ API_KEY }, { validationResponse: { status: 'spamtrap' } });
+    const { context, calls } = loadWorker({ API_KEY }, { validationResponse: { address: 'test@example.com', status: 'spamtrap' } });
 
     await context.handleRequest(fetchEvent(formRequest('email=test%40example.com')));
 
@@ -252,7 +252,7 @@ test('the allow-list also gates multipart bodies', async () => {
 
     const { context, calls } = loadWorker(
         { API_KEY, VALID_STATUS: ['valid'] },
-        { validationResponse: { status: 'spamtrap' } }
+        { validationResponse: { address: 'test@example.com', status: 'spamtrap' } }
     );
 
     const request = new Request('https://example.com/subscribe', {
@@ -424,8 +424,55 @@ for (const [name, body] of [
     });
 }
 
+// Field types are part of the shape (check E7): a validation result has
+// address and status as strings. Anything else on a 2xx is an API error with
+// HTTP 200, so the Worker fails open instead of rewriting the address.
+for (const [name, body] of [
+    ['a numeric status', { address: 'test@example.com', status: 1 }],
+    ['a null status', { address: 'test@example.com', status: null, sub_status: '' }],
+    ['a boolean status', { address: 'test@example.com', status: false }],
+    ['an object status', { address: 'test@example.com', status: {} }],
+    ['an array status', { address: 'test@example.com', status: ['invalid'] }],
+    ['a numeric address', { address: 5, status: 'invalid' }],
+    ['a null address', { address: null, status: 'invalid' }],
+    ['no address', { status: 'invalid' }],
+]) {
+    test(`a 2xx with ${name} is an API error with HTTP 200: logged, and the address is forwarded unchanged`, async () => {
+        const { context, calls, errors } = loadWorker(
+            { API_KEY, VALID_STATUS: ['valid'] },
+            { validationResponse: body }
+        );
+
+        const result = await context.validateEmail('test@example.com', '198.51.100.7');
+        assert.strictEqual(typeof result, 'string', JSON.stringify(result));
+        assert.strictEqual(JSON.parse(result).error, 'HTTP 200');
+
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test');
+        assert.ok(errors.length > 0, 'expected an error log line');
+    });
+}
+
+test('the documented validate examples, with their null and empty fields, are still results', async () => {
+    for (const body of [
+        {
+            address: 'valid@example.com', status: 'valid', sub_status: '', free_email: false, did_you_mean: null,
+            account: null, domain: null, domain_age_days: '9692', smtp_provider: 'example', mx_found: 'true',
+            mx_record: 'mx.example.com', firstname: 'zero', lastname: 'bounce', gender: 'male', country: 'United States',
+            region: 'Florida', city: 'West Palm Beach', zipcode: '33401', processed_at: '2023-03-23 13:30:28.105',
+        },
+        { address: 'invalid@example.com', status: 'invalid', sub_status: 'failed_syntax_check', account: '', mx_record: null },
+        { address: 'a@example.com', status: 'a_status_added_later' },
+    ]) {
+        const { context } = loadWorker({ API_KEY }, { validationResponse: body });
+        const result = await context.validateEmail('test@example.com', '198.51.100.7');
+        assert.strictEqual(typeof result, 'object', JSON.stringify(body));
+        assert.strictEqual(result.status, body.status);
+    }
+});
+
 test('a 2xx validation result with an empty error field is still a result', async () => {
-    const { context } = loadWorker({ API_KEY }, { validationResponse: { status: 'invalid', error: '', success: true } });
+    const { context } = loadWorker({ API_KEY }, { validationResponse: { address: 'test@example.com', status: 'invalid', error: '', success: true } });
 
     const result = await context.validateEmail('test@example.com', '198.51.100.7');
 
@@ -480,7 +527,7 @@ test('a transport error message with quotes still yields valid JSON', async () =
 // ---------------------------------------------------------------------------
 
 test('a form whose address field has another name is forwarded byte for byte when the address is accepted', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'valid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'valid' } });
     const sent = 'contact=john%40example.com&note=a%26b%3Dc&pw=p%2Bq%25&greeting=hello+world';
 
     await context.handleRequest(fetchEvent(formRequest(sent)));
@@ -491,7 +538,7 @@ test('a form whose address field has another name is forwarded byte for byte whe
 });
 
 test('a rejected address in a field with another name becomes INVALID and nothing else changes', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(formRequest('contact=john%40example.com&note=a%26b%3Dc&x=1')));
 
@@ -501,7 +548,7 @@ test('a rejected address in a field with another name becomes INVALID and nothin
 });
 
 test('an address in the last field is validated and rewritten too', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(formRequest('name=T&contact=john%40example.com')));
 
@@ -510,7 +557,7 @@ test('an address in the last field is validated and rewritten too', async () => 
 });
 
 test('malformed percent-encoding elsewhere in the form does not skip validation', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(formRequest('contact=john%40example.com&x=%E0%A4%A&y=1')));
 
@@ -520,7 +567,7 @@ test('malformed percent-encoding elsewhere in the form does not skip validation'
 });
 
 test('a rejected your-email address is itself rewritten, and no extra email field is added', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(formRequest('your-email=bad%40example.com&name=T%26C')));
 
@@ -529,7 +576,7 @@ test('a rejected your-email address is itself rewritten, and no extra email fiel
 });
 
 test('a rejected email field is rewritten in place and the other fields keep their encoding', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(formRequest('name=Jo%20Doe&email=bad%40example.com&email=other%40example.com&n=%7E')));
 
@@ -542,7 +589,7 @@ test('a rejected email field is rewritten in place and the other fields keep the
 
 test('an API_KEY with whitespace or control characters is refused and logged, and no request is made', async () => {
     for (const badKey of [`${API_KEY}\n`, ` ${API_KEY}`, `${API_KEY}\t`, `${API_KEY}\u0000x`, `${API_KEY}\u007f`, 'two words', '']) {
-        const { context, calls, errors } = loadWorker({ API_KEY: badKey, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+        const { context, calls, errors } = loadWorker({ API_KEY: badKey, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
         await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
 
@@ -601,7 +648,7 @@ function multipartRequest(body, contentType) {
 test('a multipart body with binary file parts is forwarded byte for byte when the address is accepted', async () => {
     const boundary = '----zbtestboundary';
     const sent = multipartWithFiles(boundary, 'person@example.com');
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'valid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'valid' } });
 
     await context.handleRequest(fetchEvent(multipartRequest(sent, `multipart/form-data; boundary=${boundary}`)));
 
@@ -613,7 +660,7 @@ test('a multipart body with binary file parts is forwarded byte for byte when th
 test('a rejected multipart address becomes INVALID and the binary file parts are untouched', async () => {
     const boundary = '----zbtestboundary';
     const sent = multipartWithFiles(boundary, 'person@example.com');
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(multipartRequest(sent, `multipart/form-data; boundary=${boundary}`)));
 
@@ -632,7 +679,7 @@ test('an address inside a file part is neither validated nor rewritten', async (
         'someone@example.com\r\n',
         `--${boundary}--\r\n`
     );
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(multipartRequest(sent, `multipart/form-data; boundary=${boundary}`)));
 
@@ -650,7 +697,7 @@ test('a URL-encoded form is validated whatever the case of its media type and wh
         'application/x-www-form-urlencoded; charset=UTF-8',
         'Application/X-WWW-Form-URLEncoded;charset=utf-8',
     ]) {
-        const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+        const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
         await context.handleRequest(fetchEvent(formRequest('name=A&email=bad%40example.com', { headers: { 'content-type': contentType } })));
 
@@ -666,7 +713,7 @@ test('a multipart form is validated whatever the case of its media type and howe
         `Multipart/Form-Data; Boundary="${boundary}"`,
         `multipart/form-data;charset=UTF-8;boundary=${boundary}`,
     ]) {
-        const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+        const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
         await context.handleRequest(fetchEvent(multipartRequest(multipartWithFiles(boundary, 'person@example.com'), contentType)));
 
@@ -676,7 +723,7 @@ test('a multipart form is validated whatever the case of its media type and howe
 });
 
 test('a media type that merely contains a form type is not treated as one', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(formRequest('email=bad%40example.com', { headers: { 'content-type': 'text/plain; note="application/x-www-form-urlencoded"' } })));
 
@@ -689,7 +736,7 @@ test('a media type that merely contains a form type is not treated as one', asyn
 // ---------------------------------------------------------------------------
 
 test('a your-email field is validated ahead of an earlier field that also holds an address', async () => {
-    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid' } });
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
     await context.handleRequest(fetchEvent(formRequest('contact=other%40example.com&your-email=bad%40example.com')));
 
@@ -886,7 +933,7 @@ test('a validation result is stored in KV with the key redacted wherever it appe
     const kv = recordingKv();
     const { context } = loadWorker(
         { API_KEY: KEY_WITH_ENCODING, VALID_STATUS: ['valid'], LOGS: kv.LOGS },
-        { validationResponse: { status: 'valid', address: 'test@example.com', note: `seen ${KEY_WITH_ENCODING}` } }
+        { validationResponse: { address: 'test@example.com', status: 'valid', address: 'test@example.com', note: `seen ${KEY_WITH_ENCODING}` } }
     );
 
     await context.handleRequest(fetchEvent(formRequest('email=test%40example.com')));
@@ -1075,7 +1122,7 @@ test('the API key is also caught through \\uXXXX escapes and URL encoding that k
 
 test('a body nested deeper than the JSON depth limit is a failure with HTTP 200, and the submission is forwarded', async () => {
     const deep = 200000;
-    const nested = (depth) => `{"status":"valid","a":${'['.repeat(depth - 1)}${']'.repeat(depth - 1)}}`;
+    const nested = (depth) => `{"address":"a@example.com","status":"valid","a":${'['.repeat(depth - 1)}${']'.repeat(depth - 1)}}`;
     const tooDeep = { error: 'HTTP 200', message: 'ZeroBounce returned a response nested too deeply to read' };
     for (const body of ['['.repeat(deep) + ']'.repeat(deep), '['.repeat(deep), nested(deep), nested(513)]) {
         const kv = recordingKv();
@@ -1090,7 +1137,7 @@ test('a body nested deeper than the JSON depth limit is a failure with HTTP 200,
         assert.strictEqual(kv.puts.length, 1);
     }
     // At the limit, and with brackets only inside a string, it is still a result.
-    for (const body of [nested(512), `{"status":"valid","a":"${'['.repeat(deep)}"}`]) {
+    for (const body of [nested(512), `{"address":"a@example.com","status":"valid","a":"${'['.repeat(deep)}"}`]) {
         const { context } = loadWorker({ API_KEY });
         context.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
         const result = await context.validateEmail('test@example.com', '198.51.100.7');
@@ -1139,6 +1186,24 @@ test('the decode check reads a %XX run that is not valid UTF-8 as a whole, one s
     }
     const { context } = loadWorker({ API_KEY });
     assert.strictEqual(context.redactKey('Bad Request: [%FF%41%C3 %e4]'), 'Bad Request: [%FF%41%C3 %e4]');
+});
+
+test('the decode check reads every UTF-8 sequence length (2, 3 and 4 bytes) in a run that is not valid UTF-8 as a whole', () => {
+    // Keys made only of 2-, 3- or 4-byte characters (API_KEY allows them): no
+    // ASCII between them splits the run, so the one-sequence-at-a-time decoder
+    // alone must read each length; dropping one from utf8SequenceLength leaks it.
+    for (const key of ['éééééééé', '€€€€€€€€', '\u{1F600}\u{1F600}\u{1F600}\u{1F600}']) {
+        for (const junk of ['%FF', '%ff', '%80']) {
+            for (const lower of [false, true]) {
+                const { context } = loadWorker({ API_KEY: key });
+                for (const echo of [`${junk}${percentAll(key, lower)}`, `${percentAll(key, lower)}${junk}`]) {
+                    assert.strictEqual(context.holdsKey(`Bad Request: [${echo}]`, key), true, echo);
+                    // Lower-case hex is no spelling the redaction replaces, so only the check catches it.
+                    if (lower) assertHeld(key, echo);
+                }
+            }
+        }
+    }
 });
 
 test('the decode check reads "+" as a space, JSON escapes and \\uXXXX with surrogate pairs', () => {
