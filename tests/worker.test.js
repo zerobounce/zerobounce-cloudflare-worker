@@ -929,6 +929,30 @@ test('a non-2xx answer is an API error even when its body has a validation statu
     assert.ok(errors.some((line) => line.includes('HTTP 500') && line.includes('Internal')));
 });
 
+test('a 4xx or 5xx whose body looks like a validation result (string status and address, no error) is an API error, and the form is forwarded unchanged', async () => {
+    const resultBody = { address: 'test@example.com', status: 'invalid', sub_status: 'mailbox_not_found' };
+    for (const status of [400, 401, 403, 404, 429, 500, 503]) {
+        const { context, calls, errors } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+        context.fetch = async (input) => {
+            if (input instanceof Request) {
+                calls.forwarded.push(input);
+                return new Response('origin response');
+            }
+            return jsonResponse(status, resultBody);
+        };
+
+        const result = await context.validateEmail('test@example.com', '198.51.100.7');
+        assert.strictEqual(typeof result, 'string', `HTTP ${status}: a failure payload, not a validation result`);
+        assert.strictEqual(JSON.parse(result).error, `HTTP ${status}`);
+
+        errors.length = 0;
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+        // Fail open: an "invalid" status on an error answer must not rewrite the address.
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=test%40example.com&name=Test', `HTTP ${status}`);
+        assert.ok(errors.some((line) => line.includes(`HTTP ${status}`)), `HTTP ${status}: ${JSON.stringify(errors)}`);
+    }
+});
+
 test('a validation result is stored in KV with the key redacted wherever it appears', async () => {
     const kv = recordingKv();
     const { context } = loadWorker(
@@ -1146,7 +1170,8 @@ test('a body nested deeper than the JSON depth limit is a failure with HTTP 200,
 });
 
 test('strict JSON of the wrong shape on a 2xx is a failure with HTTP 200, never a result (E7)', async () => {
-    for (const body of ['0', '"x"', 'true', 'null', '[]', '[{"status":"valid"}]', '{}', '{"address":"a@example.com"}']) {
+    // Arrays, positional ones included, are never a result object.
+    for (const body of ['0', '"x"', 'true', 'null', '[]', '["x"]', '["test@example.com","valid"]', '[true,"3"]', '[{"status":"valid"}]', '{}', '{"address":"a@example.com"}']) {
         const { context } = loadWorker({ API_KEY });
         context.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
         const result = await context.validateEmail('test@example.com', '198.51.100.7');
