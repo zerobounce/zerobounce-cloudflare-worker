@@ -409,6 +409,11 @@ for (const [name, body] of [
     ['success false beside a status', { success: false, status: 'error', message: 'Invalid API key' }],
     ['success "false" beside a status', { success: 'false', status: 'invalid', message: 'Invalid API key' }],
     ['success "False" beside a status', { success: 'False', status: 'invalid', message: 'Invalid API key' }],
+    ['success "FALSE" beside a status', { success: 'FALSE', status: 'valid', address: 'a@b.c', message: 'Invalid API key' }],
+    ['success 0 beside a status', { success: 0, status: 'valid', address: 'a@b.c', message: 'Invalid API key' }],
+    ['success 0.0 beside a status', { success: 0.0, status: 'valid', address: 'a@b.c', message: 'Invalid API key' }],
+    ['success "0" beside a status', { success: '0', status: 'valid', address: 'a@b.c', message: 'Invalid API key' }],
+    ['success " false " beside a status', { success: ' false ', status: 'valid', address: 'a@b.c', message: 'Invalid API key' }],
 ]) {
     test(`a 2xx with ${name} is an API error: logged, and the address is forwarded unchanged`, async () => {
         const { context, calls, errors } = loadWorker(
@@ -423,6 +428,18 @@ for (const [name, body] of [
         assert.ok(errors.some((line) => line.includes('Invalid API key')), 'expected the API message in an error log line');
     });
 }
+
+test('a real true flag or a non-flag beside a status stays a validation result', async () => {
+    for (const success of [true, 1, 1.0, '1', 'TRUE', ' true ', 'x', 0.4, 5, '']) {
+        const { context, calls, errors } = loadWorker(
+            { API_KEY, VALID_STATUS: ['valid'] },
+            { validationResponse: { address: 'test@example.com', status: 'invalid', success } }
+        );
+        await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
+        assert.strictEqual(await calls.forwarded[0].text(), 'email=INVALID&name=Test', `success ${JSON.stringify(success)} is a result`);
+        assert.ok(errors.every((line) => !line.includes('validation failed')), `success ${JSON.stringify(success)} is not an API error`);
+    }
+});
 
 // Field types are part of the shape (check E7): a validation result has
 // address and status as strings. Anything else on a 2xx is an API error with
@@ -588,7 +605,7 @@ test('a rejected email field is rewritten in place and the other fields keep the
 // ---------------------------------------------------------------------------
 
 test('an API_KEY with whitespace or control characters is refused and logged, and no request is made', async () => {
-    for (const badKey of [`${API_KEY}\n`, ` ${API_KEY}`, `${API_KEY}\t`, `${API_KEY}\u0000x`, `${API_KEY}\u007f`, 'two words', '']) {
+    for (const badKey of [`${API_KEY}\n`, ` ${API_KEY}`, `${API_KEY}\t`, `${API_KEY}\u0000x`, `${API_KEY}\u007f`, 'two words', '', `${API_KEY}\u202E`, `${API_KEY}\u200B`, `${API_KEY}\u2066`, `${API_KEY}\u00AD`, `${API_KEY}\u180E`, `${API_KEY}\u0600`, `${API_KEY}\u0890`, `${API_KEY}\u0891`, `${API_KEY}\uFFF9`, `${API_KEY}\u{1D173}`]) {
         const { context, calls, errors } = loadWorker({ API_KEY: badKey, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status: 'invalid' } });
 
         await context.handleRequest(fetchEvent(formRequest('email=test%40example.com&name=Test')));
@@ -1229,6 +1246,20 @@ test('the decode check reads every UTF-8 sequence length (2, 3 and 4 bytes) in a
             }
         }
     }
+});
+
+test('the decode check reads brace, hex, octal and wide-U quote spellings, and folds case', () => {
+    const key = "a'b";
+    assertHeld(key, 'a\\u{27}b');
+    assertHeld(key, 'a\\U{27}b');
+    assertHeld(key, 'a\\U00000027b');
+    assertHeld(key, 'a\\047b');
+    assertHeld(key, 'a\\x27b');
+    const { context } = loadWorker({ API_KEY: key });
+    assert.strictEqual(context.holdsKey('a%u0027b', key), false);
+    assertHeld('\u00df', 'SS');
+    assertHeld('\u1F80\u0301', '\u1F84');
+    assertHeld('\u1F84', '\u1F80\u0301');
 });
 
 test('the decode check reads "+" as a space, JSON escapes and \\uXXXX with surrogate pairs', () => {

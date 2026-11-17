@@ -37,7 +37,7 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 | Binding | Purpose |
 | --- | --- |
 | `API_KEY` | ZeroBounce API key, an encrypted secret. Without it no validation happens. |
-| `API_REGION` | `us`, `eu`, or unset/`global` for the default host. |
+| `API_REGION` | `us` or `usa`, `eu`, or unset / `global` / `default` for the global host. |
 | `API_TIMEOUT` | Milliseconds, passed to `AbortSignal.timeout`. Defaults to 10000 when unset or not a positive number. |
 | `VALID_STATUS` | Allow-list of ZeroBounce statuses. A status outside it is rewritten to `INVALID`. |
 | `BYPASS_PATH` | Paths that are forwarded untouched. |
@@ -85,3 +85,11 @@ Changing these would alter live behaviour, so they are documented rather than fi
   The `\"\s+` alternative is what actually matches multipart bodies.
 - The Worker is MIT, stated both in the file header and in `LICENSE`, matching the 13 SDK repositories.
   The header previously said `GPL-2.0+`; that was reconciled to MIT by the maintainer, not assumed.
+
+## Changelog
+
+There is no `CHANGELOG.md`. This repository is not a published package, so a behaviour change is described in the commit that makes it and in the README when a binding or a forwarded body changes.
+
+## Releasing
+
+There is no Publish workflow and no registry package. Shipping a change means deploying `cloudflare-worker-zerobounce.js`. Do not bump `package.json` or add a tag unless a maintainer asks. The version stays `1.0.0`.

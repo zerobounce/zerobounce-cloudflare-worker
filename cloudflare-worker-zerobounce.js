@@ -242,9 +242,9 @@ function logValidation(event, email, url, result) {
  * or empty the Worker keeps calling the global host, so Workers deployed
  * before this setting existed behave exactly as they did before.
  *
- *   API_REGION unset / "global"  ->  https://api.zerobounce.net/v2/validate
- *   API_REGION = "us"            ->  https://api-us.zerobounce.net/v2/validate
- *   API_REGION = "eu"            ->  https://api-eu.zerobounce.net/v2/validate
+ *   API_REGION unset / "global" / "default" / ""  ->  https://api.zerobounce.net/v2/validate
+ *   API_REGION = "us" or "usa"                    ->  https://api-us.zerobounce.net/v2/validate
+ *   API_REGION = "eu"                             ->  https://api-eu.zerobounce.net/v2/validate
  *
  * ZeroBounce documents no regional bulk or warm-up host, so this applies to
  * the single-email /validate endpoint only.
@@ -357,13 +357,153 @@ function percentDecoded(text) {
     });
 }
 
-const JSON_UNESCAPES = { '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+const JSON_UNESCAPES = { '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', "'": "'" };
 
-/** Each JSON string escape (\" \\ \/ \b \f \n \r \t \uXXXX) decoded, in one left-to-right pass. */
+function hexDigit(char) {
+    const digit = parseInt(char, 16);
+    return Number.isNaN(digit) ? -1 : digit;
+}
+
+function codePointText(code) {
+    if (code < 0 || code > 0x10ffff) return '\uFFFD';
+    return String.fromCodePoint(code);
+}
+
+/**
+ * JSON and other backslash escapes, including `\u{27}`, `\047`, `\U{27}` and `\x27`.
+ * `%u0027` is not an escape and is left unchanged.
+ */
 function jsonUnescaped(text) {
-    return text.replace(/\\(?:u([0-9A-Fa-f]{4})|(["\\/bfnrt]))/g, (_, hex, simple) =>
-        hex ? String.fromCharCode(parseInt(hex, 16)) : JSON_UNESCAPES[simple]
-    );
+    let out = '';
+    let i = 0;
+    while (i < text.length) {
+        if (text[i] !== '\\' || i + 1 >= text.length) {
+            out += text[i];
+            i += 1;
+            continue;
+        }
+        const next = text[i + 1];
+        if (Object.prototype.hasOwnProperty.call(JSON_UNESCAPES, next)) {
+            out += JSON_UNESCAPES[next];
+            i += 2;
+            continue;
+        }
+        if ((next === 'u' || next === 'U') && text[i + 2] === '{') {
+            let j = i + 3;
+            let digits = '';
+            while (j < text.length && digits.length < 8 && hexDigit(text[j]) >= 0) {
+                digits += text[j];
+                j += 1;
+            }
+            if (digits && text[j] === '}') {
+                out += codePointText(parseInt(digits, 16));
+                i = j + 1;
+                continue;
+            }
+        }
+        if (next === 'u' || next === 'U') {
+            const wide = next === 'U';
+            let hex = text.slice(i + 2, i + 2 + (wide ? 8 : 4));
+            if (wide && hex.length === 8 && /^[0-9A-Fa-f]{8}$/.test(hex)) {
+                const code = parseInt(hex, 16);
+                if (code <= 0x10ffff) {
+                    out += codePointText(code);
+                    i += 10;
+                    continue;
+                }
+                hex = text.slice(i + 2, i + 6);
+            }
+            if (/^[0-9A-Fa-f]{4}$/.test(hex)) {
+                let code = parseInt(hex, 16);
+                if (code >= 0xd800 && code <= 0xdbff && text[i + 6] === '\\' && text[i + 7] === 'u') {
+                    const low = text.slice(i + 8, i + 12);
+                    if (/^[0-9A-Fa-f]{4}$/.test(low)) {
+                        const lowCode = parseInt(low, 16);
+                        if (lowCode >= 0xdc00 && lowCode <= 0xdfff) {
+                            code = 0x10000 + ((code - 0xd800) << 10) + (lowCode - 0xdc00);
+                            out += codePointText(code);
+                            i += 12;
+                            continue;
+                        }
+                    }
+                }
+                out += codePointText(code);
+                i += 6;
+                continue;
+            }
+        }
+        if (next === 'x' || next === 'X') {
+            if (text[i + 2] === '{') {
+                let j = i + 3;
+                let digits = '';
+                while (j < text.length && digits.length < 6 && hexDigit(text[j]) >= 0) {
+                    digits += text[j];
+                    j += 1;
+                }
+                if (digits && text[j] === '}') {
+                    out += codePointText(parseInt(digits, 16));
+                    i = j + 1;
+                    continue;
+                }
+            }
+            if (hexDigit(text[i + 2]) >= 0 && hexDigit(text[i + 3]) >= 0) {
+                out += String.fromCharCode(hexDigit(text[i + 2]) * 16 + hexDigit(text[i + 3]));
+                i += 4;
+                continue;
+            }
+        }
+        if (next >= '0' && next <= '7') {
+            let value = next.charCodeAt(0) - 48;
+            let len = 2;
+            if (next <= '3' && text[i + 2] >= '0' && text[i + 2] <= '7') {
+                value = value * 8 + (text[i + 2].charCodeAt(0) - 48);
+                len = 3;
+                if (text[i + 3] >= '0' && text[i + 3] <= '7') {
+                    value = value * 8 + (text[i + 3].charCodeAt(0) - 48);
+                    len = 4;
+                }
+            } else if (text[i + 2] >= '0' && text[i + 2] <= '7') {
+                value = value * 8 + (text[i + 2].charCodeAt(0) - 48);
+                len = 3;
+            }
+            out += String.fromCharCode(value);
+            i += len;
+            continue;
+        }
+        out += text[i];
+        i += 1;
+    }
+    return out;
+}
+
+/** Full case fold of one scalar via the default Unicode mappings, with no locale. */
+function foldedScalars(scalar) {
+    let current = [scalar];
+    for (let round = 0; round < 3; round++) {
+        const next = [];
+        for (const item of current) {
+            for (const upper of item.toUpperCase()) {
+                for (const lower of upper.toLowerCase()) {
+                    next.push(lower);
+                }
+            }
+        }
+        if (next.join('') === current.join('')) break;
+        current = next;
+    }
+    return current;
+}
+
+/** NFD, then the default full case fold, then drop U+0307 after `i`. */
+function simpleFoldSpelling(text) {
+    let folded = [];
+    for (const scalar of [...String(text).normalize('NFD')]) {
+        folded.push(...foldedScalars(scalar));
+    }
+    folded = [...folded.join('').normalize('NFD')];
+    return folded
+        .filter((scalar, index) => !(scalar.codePointAt(0) === 0x307 && index > 0 && folded[index - 1] === 'i'))
+        .join('');
 }
 
 /** The Worker's own request encoding plus three echo layers (standard.md §3). */
@@ -390,8 +530,12 @@ function holdsKey(text, key) {
         }
         layer = next;
     }
+    const foldedKey = simpleFoldSpelling(key);
     for (const view of views) {
         if (view.includes(key)) {
+            return true;
+        }
+        if (foldedKey && simpleFoldSpelling(view).includes(foldedKey)) {
             return true;
         }
     }
@@ -494,11 +638,31 @@ function apiErrorText(data, fallback = 'ZeroBounce returned no validation status
 
 /**
  * Whether a 2xx body is an API error even though it carries a status: a
- * success of false (also as the string "false" or "False"), or a non-empty
- * error, error_message or Error string. A validation result has neither.
+ * real false success flag, or a non-empty error, error_message or Error
+ * string. A real flag is a boolean, the number 0 or 1 (including 1.0), or
+ * "true" / "false" / "0" / "1" in any case, trimmed. Anything else, including
+ * "x" and 0.4, is not a flag. A validation result has neither.
  */
+function isSuccessFlag(value) {
+    if (typeof value === 'boolean') return true;
+    if (typeof value === 'number' && (value === 0 || value === 1)) return true;
+    if (typeof value === 'string') {
+        const text = value.trim().toLowerCase();
+        return text === 'true' || text === 'false' || text === '0' || text === '1';
+    }
+    return false;
+}
+
+function isFalseSuccessFlag(value) {
+    if (!isSuccessFlag(value)) return false;
+    if (typeof value === 'boolean') return value === false;
+    if (typeof value === 'number') return value === 0;
+    const text = value.trim().toLowerCase();
+    return text === 'false' || text === '0';
+}
+
 function isApiErrorBody(data) {
-    if (data.success === false || data.success === 'false' || data.success === 'False') {
+    if (isFalseSuccessFlag(data.success)) {
         return true;
     }
     return ['error', 'error_message', 'Error'].some(
@@ -511,13 +675,43 @@ function isApiErrorBody(data) {
  * The fetch request can be aborted automatically using a timeout.
  * The function is async however it waits itself for the response.
  */
+/**
+ * A key with a control, Unicode whitespace, or an invisible character is refused
+ * before any request. An ordinary space is refused too, including in the middle:
+ * a pasted key often carries one.
+ */
+function apiKeyRejected(key) {
+    const text = String(key);
+    if (!text) return true;
+    for (const char of text) {
+        const code = char.codePointAt(0);
+        if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+        if (
+            code === 0xad ||
+            code === 0x600 ||
+            code === 0x890 ||
+            code === 0x891 ||
+            (code >= 0x180b && code <= 0x180f) ||
+            code === 0x200b ||
+            code === 0x202e ||
+            code === 0x2066 ||
+            code === 0xfff9 ||
+            code === 0x1d173
+        ) {
+            return true;
+        }
+        if (/\s/u.test(char)) return true;
+    }
+    return false;
+}
+
 async function validateEmail(email, ip_address) {
     if (typeof API_KEY !== 'undefined') {
         // A pasted key often carries a trailing newline or space, which would
         // be sent as %0A or %20 and fail on every request. Refuse it, without
         // logging the key itself.
-        if (!/^[^\s\u0000-\u001f\u007f]+$/.test(String(API_KEY))) {
-            return validationFailure('Invalid API_KEY', 'API_KEY is empty or contains whitespace or control characters; check the secret');
+        if (apiKeyRejected(API_KEY)) {
+            return validationFailure('Invalid API_KEY', 'API_KEY is empty or contains whitespace, a control character, or an invisible character; check the secret');
         }
 
         const url = new URL(validationEndpoint());
