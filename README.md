@@ -28,7 +28,7 @@ binding is optional: when one is missing the Worker falls back to forwarding the
 | Binding | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `API_KEY` | Secret | — | Your ZeroBounce API key. Without it the Worker validates nothing. A key that is empty or contains whitespace, a control character, or an invisible character (a pasted trailing newline, for example) is refused and logged, and nothing is validated. |
-| `API_REGION` | Variable | `global` | Which ZeroBounce host to validate against: `global`, `us` or `eu`. |
+| `API_REGION` | Variable | `global` | Which ZeroBounce host to validate against: `global` or `default`, `us` or `usa`, or `eu`. |
 | `API_TIMEOUT` | Variable | `10000` | Milliseconds before the validation request is aborted. A value that is not a positive number is logged and replaced by the default. |
 | `VALID_STATUS` | Variable (JSON array) | — | Statuses you accept, e.g. `["valid","catch-all"]`. Anything else is rewritten to `INVALID`. |
 | `BYPASS_PATH` | Variable (JSON array) | — | Paths to forward untouched, e.g. `["/wp-login.php"]`. |
