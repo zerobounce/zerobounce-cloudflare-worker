@@ -199,8 +199,8 @@ const BOUNDARY_CHARS = /^[0-9A-Za-z'()+_,\-./:=? ]+$/;
  * holds a character outside RFC 2046's bchars is ambiguous too, and so is an
  * unquoted one with a comma: the comma is a bchar, but PHP and undici cut an
  * unquoted value there. (A backslash is no bchar, so a boundary holding one is
- * refused here; there is no separate backslash rule.) A header with no
- * boundary parameter at all returns boundary null: the body is not read.
+ * refused here; there is no separate backslash rule.) A header that does not
+ * mention "boundary" at all returns boundary null: the body is not read.
  */
 function multipartBoundary(contentType) {
     const text = String(contentType);
@@ -215,7 +215,10 @@ function multipartBoundary(contentType) {
     }
     return {
         boundary: invalid ? null : boundary,
-        ambiguous: count(text) - own > 1 || invalid,
+        // A header that mentions "boundary" (as boundary*, xboundary, inside a
+        // quoted value) without one plain boundary parameter is ambiguous too:
+        // PHP finds the word anywhere and reads the body, the Worker would not.
+        ambiguous: count(text) - own > 1 || invalid || (boundary === null && count(text) > 0),
     };
 }
 
@@ -480,7 +483,19 @@ const MAX_ADDRESS_LENGTH = 320;
  * space that an origin may keep as part of the value.
  */
 function asciiTrim(value) {
-    return String(value).replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
+    // A loop, not a regex: /^[ \t\r\n]+|[ \t\r\n]+$/g is quadratic on a long
+    // run of blanks that does not reach the end, and values are attacker text.
+    const text = String(value);
+    const blank = (c) => c === 0x20 || c === 0x09 || c === 0x0d || c === 0x0a;
+    let start = 0;
+    let end = text.length;
+    while (start < end && blank(text.charCodeAt(start))) {
+        start++;
+    }
+    while (end > start && blank(text.charCodeAt(end - 1))) {
+        end--;
+    }
+    return text.slice(start, end);
 }
 
 /** Whether the whole value, trimmed, is one address. Runs on at most 320 characters. */

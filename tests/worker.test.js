@@ -2055,8 +2055,9 @@ test('R2 bypass: the boundary parameter is parsed as a header parameter', async 
         assert.strictEqual(calls.validation.length, 1, type);
         assert.strictEqual(text, fixed, type);
     }
-    // No usable boundary: nothing is read, the request is forwarded.
-    for (const type of ['multipart/form-data', 'multipart/form-data; x="boundary=zb-b"']) {
+    // No boundary mentioned at all: nothing is read, the request is forwarded.
+    // (A header that mentions boundary without a plain parameter is answered 400.)
+    for (const type of ['multipart/form-data', 'multipart/form-data; charset=utf-8']) {
         const { calls, text } = await runHandler(multipartRequest(body, type), { status: 'valid' });
         assert.strictEqual(calls.validation.length, 0, type);
         assert.strictEqual(text, body, type);
@@ -2075,6 +2076,30 @@ test('R2 bypass: more than one boundary parameter is answered 400 by the Worker,
         assert.strictEqual(worker.calls.validation.length, 0);
         assert.strictEqual(worker.errors.length, 1);
     }
+});
+
+test('a header that mentions boundary but has no boundary parameter is answered 400', async () => {
+    // PHP finds "boundary" anywhere in the header and reads the body; the Worker would not.
+    const body = rawMp('B', field('email', 'e@bad.example'));
+    for (const type of ["multipart/form-data; boundary*=B", 'multipart/form-data; xboundary=B', 'multipart/form-data; boundaryx=B', 'multipart/form-data; x="boundary=B"']) {
+        const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+        const response = await worker.context.handleRequest(fetchEvent(multipartRequest(body, type)));
+        assert.strictEqual(response.status, 400, type);
+        assert.strictEqual(worker.calls.forwarded.length, 0, type);
+        assert.strictEqual(worker.calls.validation.length, 0, type);
+    }
+    // A multipart header with no mention of boundary at all is forwarded unread, as before.
+    const { calls, text } = await runHandler(multipartRequest(body, 'multipart/form-data'), { status: 'valid' });
+    assert.strictEqual(calls.validation.length, 0);
+    assert.strictEqual(text, body);
+});
+
+test('a long run of blanks inside a field value is trimmed in linear time', async () => {
+    // A regex trim (/^\s+|\s+$/g) is quadratic on a run of blanks that does not reach the end.
+    const blanks = '+'.repeat(200000);
+    const started = Date.now();
+    await runHandler(formRequest(`note=a${blanks}b&email2=x%40${blanks}y&email=g%40ok.example`), { status: 'valid' });
+    assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
 });
 
 test('R2 bypass: a delimiter line is the boundary and nothing else but blanks and a line break', async () => {

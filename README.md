@@ -122,7 +122,8 @@ use `BYPASS_PATH`, or name that field without the word `email`.
 **Multipart forms.** A part is an email field when its header block (all header lines, folded lines included) mentions
 `email`, whatever the `Content-Disposition` looks like. If there is no such part, the Worker takes the first text part
 whose whole value is an address. A file part (a part with any `filename` parameter, even an empty one) is not read, unless its headers
-mention `email`. Then it is treated like any email field, and rewritten only if its value is an address. A part with no
+mention `email`. Then it is treated like any email field: when `VALID_STATUS` is set, a value that holds `@` and is not the
+validated address is rewritten. A part with no
 `filename` is a text field, even when its `Content-Type` is binary. Only the value bytes are replaced; the whitespace
 around them stays.
 
@@ -133,7 +134,9 @@ A multipart email part with a `Content-Transfer-Encoding` other than `7bit`, `8b
 The whole `Content-Type` is read, in any letter case. If it contains `multipart/form-data`, the body is multipart.
 Otherwise, if it contains `application/x-www-form-urlencoded`, it is URL-encoded. Otherwise the JSON branch applies, as
 before. A `Content-Type` that names both form types, or a form type with anything else before the first `;` (for
-example `multipart/form-data, x`, `multipart/form-data x` or `text/plain, multipart/form-data`), is ambiguous. Normal
+example `multipart/form-data, x`, `multipart/form-data x` or `text/plain, multipart/form-data`), is ambiguous. So is any other
+`Content-Type` that mentions a form type, such as `text/plain; x=multipart/form-data`, and a multipart `Content-Type`
+that mentions `boundary` (as `boundary*=` or `xboundary=`) without a plain `boundary` parameter. Normal
 values such as `multipart/form-data; boundary=...`, with surrounding spaces, still work.
 
 The boundary value is checked after parsing. It must not be empty or longer than 70 characters. It may use only the
