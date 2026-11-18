@@ -35,7 +35,7 @@ Node.js 22 or newer. There are no dependencies and no lockfile; do not add one w
 
 ## Environment bindings
 
-All of them are optional, and the Worker degrades to a pass-through when one is missing.
+All of them are optional, and the Worker degrades to a pass-through when one is missing. The `400` for an ambiguous request does not depend on them.
 
 | Binding | Purpose |
 | --- | --- |
@@ -43,7 +43,7 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 | `API_REGION` | `us` or `usa`, `eu`, or unset / `global` / `default` for the global host. |
 | `API_TIMEOUT` | Milliseconds, passed to `AbortSignal.timeout`. Defaults to 10000 when unset, empty, not a whole number, or outside 1 to 600000. |
 | `VALID_STATUS` | Allow-list of ZeroBounce statuses (JSON array preferred; the guide's quoted forms work, see Conventions). A status outside it is rewritten to `INVALID`. |
-| `BYPASS_PATH` | Paths that are forwarded untouched (JSON array preferred; a plain string is one entry). Exact match only. |
+| `BYPASS_PATH` | Paths that are forwarded untouched (JSON array preferred; a plain string is split on commas, semicolons, pipes and spaces; one word is one entry). Exact match only. |
 | `LOGS` | KV namespace. When bound, each validation result is written to it. |
 
 ## Conventions
@@ -67,7 +67,11 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   field, then (fallback) any field whose value is an address. Never send a value that is not an address. With
   `VALID_STATUS` set, every other email field that holds an address different from the validated one is rewritten to
   `INVALID`, and a rejected status rewrites all of them. File parts are read only if their headers mention `email`.
-  A `Content-Type` that contains `boundary` more than once is answered with `400 Bad Request`.
+  Any email-field value that contains `@` and is not exactly the validated address is rewritten to `INVALID`, even if it
+  is not a plain address (and without an API call). Multipart `name*=` (RFC 2231) names are decoded. A file part is any
+  part with a `filename` parameter, even an empty one. The whole `Content-Type` picks the branch (multipart, then
+  URL-encoded, else JSON). An ambiguous `Content-Type`, or a `boundary` that is repeated, empty, over 70 characters or
+  has a non-RFC 2046 character (or a comma, unquoted), is answered with `400 Bad Request`, whatever the bindings.
 - **Binding lists are forgiving.** `VALID_STATUS` and `BYPASS_PATH` are read as a JSON array of strings first. Otherwise
   the text loses every bracket and quote mark (straight and curly, because the live guide uses curly quotes) and is
   split on commas, semicolons, pipes and whitespace. Statuses that are not one of the seven API statuses are logged
