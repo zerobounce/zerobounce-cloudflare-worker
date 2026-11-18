@@ -56,14 +56,18 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   never logged: `logValidation` records the *incoming* request's pathname, not the validation URL.
 - **There is no regional bulk or warm-up host.** `API_REGION` applies to `/v2/validate` only. `API_REGION` is matched
   against a fixed allow-list and an unrecognised value falls back to the global host, so a typo cannot redirect the key.
-- **The regexes are deliberate and fragile.** They are flagged `DO NOT EDIT!` upstream and they are built from
-  strings (so every backslash is doubled). Do not "tidy" them.
+- **The address regex is deliberate.** It is built from a string (so every backslash is doubled) and it is only ever
+  applied anchored, to one trimmed value at a time. Never run an address regex unanchored over attacker text: that was a
+  ReDoS and a mis-extraction bug.
+- **Field names follow PHP.** `formFields` and `multipartFields` normalise names the way PHP does, so `your.email` and
+  `%20email` count and `?email` does not. An ambiguous multipart `boundary` is answered with `400 Bad Request`.
 - **URL-encoded bodies are rewritten by byte span, never decoded and re-encoded as a whole.** `formFields` splits
   the raw body on `&` and decodes each field with `URLSearchParams` (which never throws on bad percent-encoding);
   `replaceFieldValues` swaps only the rejected value. Every other byte must reach the origin as sent.
-- **Multipart bodies are never decoded as a whole either.** `multipartAddress` splits the raw body on its boundary,
-  skips file parts, and reads the headers and value of each remaining part as a one-character-per-byte string, so
-  offsets are byte offsets; `replaceFieldValues` then swaps only the address. A UTF-8 decode and re-encode of
+- **Multipart bodies are never decoded as a whole either.** `multipartFields` splits the raw body on its boundary
+  and reads the headers and value of each part as a one-character-per-byte string, so offsets are byte offsets. File
+  parts are skipped unless they are named like an email field. `chooseAddressField` picks the address and
+  `fieldsToRewrite` lists the fields to change; `replaceFieldValues` then swaps only those values. A UTF-8 decode and re-encode of
   the body would replace every non-UTF-8 byte of an uploaded file with U+FFFD.
 - **Content types are compared by media type** (`mediaType`: lower case, parameters dropped), never with `===` on the
   header or with `includes`.
@@ -83,7 +87,7 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 
 Changing these would alter live behaviour, so they are documented rather than fixed. Raise them with a maintainer first.
 
-- The Worker is MIT, stated both in the file header and in `LICENSE`, matching the 13 SDK repositories.
+- The Worker is MIT, stated both in the file header and in `LICENSE`, matching the other ZeroBounce SDK repositories.
   The header previously said `GPL-2.0+`; that was reconciled to MIT by the maintainer, not assumed.
 
 ## Changelog

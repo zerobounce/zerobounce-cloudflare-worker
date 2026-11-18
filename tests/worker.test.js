@@ -1385,12 +1385,12 @@ test('H1: only the value bytes are replaced; the whitespace around them stays', 
 
 test('H1: a filename (or filename*) marks a file; a filename that quotes name="email" does not rename the part', async () => {
     const file = 'Content-Disposition: form-data; name="doc"; filename="name=\\"email\\"; x.txt"\r\n\r\nsomeone@x.com';
-    const star = 'Content-Disposition: form-data; name="email"; filename*=UTF-8\'\'a.txt\r\n\r\nsomeone@x.com';
+    const star = 'Content-Disposition: form-data; name="doc2"; filename*=UTF-8\'\'a.txt\r\n\r\nsomeone@x.com';
     const { calls } = await runHandler(mpRequest(mpBody(file, star)));
 
     assert.strictEqual(calls.validation.length, 0);
 
-    // The quoted filename is not the field name: the part is named "doc" and is a file.
+    // The quoted filename is not the field name: the part is named "x" and is a file.
     const text = mpBody('Content-Disposition: form-data; name="x"; filename="a; name=email"\r\n\r\nsomeone@x.com');
     assert.strictEqual((await runHandler(mpRequest(text))).calls.validation.length, 0);
 });
@@ -1859,4 +1859,507 @@ test('transport: a null API_REGION uses the global host without logging', async 
     await context.validateEmail('a@x.com', null);
     assert.strictEqual(calls.validation[0].url.origin, 'https://api.zerobounce.net');
     assert.ok(!logs.some((line) => line.includes('API_REGION')));
+});
+
+// ---------------------------------------------------------------------------
+// Round 2: legacy binding formats, parser-difference bypasses, Lows, survivors
+// ---------------------------------------------------------------------------
+
+const validated = (calls) => calls.validation.map((call) => call.url.searchParams.get('email'));
+const rawMp = (boundary, ...parts) => parts.map((part) => `--${boundary}\r\n${part}\r\n`).join('') + `--${boundary}--\r\n`;
+const disp = (name, value, extra = '') => `Content-Disposition: form-data; ${name}\r\n${extra}\r\n${value}`;
+
+test('R2 HIGH: the zerobounce.net guide strings are read as lists', async () => {
+    const sent = 'email=a%40x.com';
+    for (const [status, rewritten] of [['valid', false], ['catch-all', false], ['unknown', false], ['invalid', true], ['spamtrap', true]]) {
+        const { text } = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: "['valid', 'catch-all', 'unknown']" }, status });
+        assert.strictEqual(text, rewritten ? 'email=INVALID' : sent, status);
+    }
+    for (const [path, bypassed] of [['/login', true], ['/logout', true], ['/login,', false], ['/log', false], ['/other', false]]) {
+        const { calls } = await runHandler(
+            formRequest(sent, { url: `https://example.com${path}` }),
+            { bindings: { BYPASS_PATH: "'/login,' '/logout,'" } }
+        );
+        assert.strictEqual(calls.validation.length, bypassed ? 0 : 1, path);
+    }
+});
+
+test('R2 HIGH: binding formats - comma list, trailing comma, case, quotes, typed array', async () => {
+    const sent = 'email=a%40x.com';
+    const cases = [
+        ['valid,catch-all', 'catch-all', false],
+        ['valid, catch-all', 'catch-all', false],
+        ['valid catch-all', 'catch-all', false],
+        ['valid,catch-all', 'unknown', true],
+        ['["valid",]', 'valid', false],
+        ['["valid",]', 'invalid', true],
+        ['["Valid"]', 'valid', false],
+        ['  ["VALID" , "Catch-All"]  ', 'catch-all', false],
+        ['"valid"', 'valid', false],
+        ["'Valid'", 'valid', false],
+        ['VALID', 'valid', false],
+        ['valid,', 'valid', false],
+        [['Valid ', '', 'catch-all,'], 'catch-all', false],
+        [['Valid'], 'invalid', true],
+    ];
+    for (const [VALID_STATUS, status, rewritten] of cases) {
+        const { text } = await runHandler(formRequest(sent), { bindings: { VALID_STATUS }, status });
+        assert.strictEqual(text, rewritten ? 'email=INVALID' : sent, `${JSON.stringify(VALID_STATUS)} ${status}`);
+    }
+    // Paths match exactly, with their case.
+    for (const [BYPASS_PATH, path, bypassed] of [['/Login', '/login', false], ['/Login', '/Login', true], [['/a', '/b,'], '/b', true], ['/a,/b', '/b', true], ['/a /b', '/a', true]]) {
+        const { calls } = await runHandler(formRequest(sent, { url: `https://example.com${path}` }), { bindings: { BYPASS_PATH } });
+        assert.strictEqual(calls.validation.length, bypassed ? 0 : 1, `${JSON.stringify(BYPASS_PATH)} ${path}`);
+    }
+});
+
+test('R2 HIGH: a blank or whitespace-only binding is not set, and is logged', async () => {
+    const sent = 'email=a%40x.com';
+    for (const blank of ['', '   ', '\n\t', ',', "''", '[]', [], ['', ' ']]) {
+        const worker = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: blank, BYPASS_PATH: blank }, status: 'invalid' });
+        // Nothing is rewritten without a VALID_STATUS list; nothing is bypassed.
+        assert.strictEqual(worker.text, sent, JSON.stringify(blank));
+        assert.strictEqual(worker.calls.validation.length, 1, JSON.stringify(blank));
+        assert.strictEqual(worker.logs.filter((line) => line.startsWith('Ignoring VALID_STATUS')).length, 1, JSON.stringify(blank));
+        assert.strictEqual(worker.logs.filter((line) => line.startsWith('Ignoring BYPASS_PATH')).length, 1, JSON.stringify(blank));
+    }
+});
+
+test('R2: a typed array with a non-string item, or another type, is logged and ignored', async () => {
+    for (const bad of [['valid', 1], 7, { a: 1 }]) {
+        const worker = await runHandler(formRequest('email=a%40x.com'), { bindings: { VALID_STATUS: bad }, status: 'invalid' });
+        assert.strictEqual(worker.text, 'email=a%40x.com');
+        assert.strictEqual(worker.logs.filter((line) => line.startsWith('Ignoring VALID_STATUS')).length, 1);
+    }
+});
+
+// --- field names the way PHP reads them -----------------------------------
+
+test('R2 bypass: url-encoded names are matched the way PHP reads them', async () => {
+    const good = 'email=g%40ok.example';
+    const evil = 'e%40bad.example';
+    for (const name of ['%20email', '+email', '%09email', 'email%00x', 'email%00', 'your.email', 'your+email', 'your_email', '%20your-email', 'email', '%20%20email']) {
+        const { calls, text } = await runHandler(formRequest(`${good}&${name}=${evil}`), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], name);
+        assert.strictEqual(text, `${good}&${name}=INVALID`, name);
+    }
+    // PHP keeps these as other names.
+    for (const name of ['%3Femail', '?email', 'email%20', 'xemail', 'email.x', 'e.mail']) {
+        const { calls, text } = await runHandler(formRequest(`${good}&${name}=${evil}`), { status: 'valid' });
+        assert.strictEqual(calls.validation.length, 1, name);
+        assert.strictEqual(text, `${good}&${name}=${evil}`, name);
+    }
+});
+
+test('R2 bypass: an alias alone is the field that is validated', async () => {
+    const { calls, text } = await runHandler(formRequest('your.email=a%40x.com&n=1'), { status: 'invalid' });
+    assert.deepStrictEqual(validated(calls), ['a@x.com']);
+    assert.strictEqual(text, 'your.email=INVALID&n=1');
+});
+
+test('R2 bypass: fallback mode reads names the same way (an alias of the found field is a repeat)', async () => {
+    const { calls, text } = await runHandler(formRequest('contact=a%40x.com&%20contact=b%40x.com&c.ontact=c%40x.com'), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['a@x.com']);
+    assert.strictEqual(text, 'contact=a%40x.com&%20contact=INVALID&c.ontact=c%40x.com');
+});
+
+test('R2 bypass: multipart names are matched the way PHP reads them', async () => {
+    for (const name of [' email', 'your.email', 'your email', 'email\0x', '\temail']) {
+        const body = mpBody(field('email', 'g@ok.example'), field(name, 'e@bad.example'));
+        const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], JSON.stringify(name));
+        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), field(name, 'INVALID')), JSON.stringify(name));
+    }
+});
+
+// --- multipart bypasses -----------------------------------------------------
+
+test('R2 bypass: a part named like an email field is a candidate even with a filename', async () => {
+    for (const extra of ['filename', 'filename=""', 'filename="a.txt"', "filename*=UTF-8''a.txt"]) {
+        const body = mpBody(field('email', 'g@ok.example'), disp(`name="email"; ${extra}`, 'e@bad.example'));
+        const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], extra);
+        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), disp(`name="email"; ${extra}`, 'INVALID')), extra);
+    }
+    // Alone, such a part holding an address is validated.
+    const alone = mpBody(disp('name="email"; filename', 'a@x.com'));
+    assert.deepStrictEqual(validated((await runHandler(mpRequest(alone), { status: 'valid' })).calls), ['a@x.com']);
+    // A file part with another name stays unread.
+    const other = mpBody(disp('name="doc"; filename', 'a@x.com'), disp('name="your-doc"; filename="a"', 'b@x.com'));
+    assert.strictEqual((await runHandler(mpRequest(other))).calls.validation.length, 0);
+});
+
+test('R2 bypass: a part with two Content-Disposition headers is a candidate if any names a candidate', async () => {
+    const twice = (a, b, value) => `Content-Disposition: form-data; ${a}\r\nContent-Disposition: form-data; ${b}\r\n\r\n${value}`;
+    for (const [a, b] of [['name="note"', 'name="email"'], ['name="email"', 'name="note"'], ['name="note"; filename="x"', 'name="your.email"']]) {
+        const body = mpBody(field('email', 'g@ok.example'), twice(a, b, 'e@bad.example'));
+        const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], `${a} ${b}`);
+        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), twice(a, b, 'INVALID')), `${a} ${b}`);
+    }
+    // For every other purpose the first header decides: a first filename makes a file ...
+    const file = mpBody(twice('name="note"; filename="a"', 'name="other"', 'a@x.com'));
+    assert.strictEqual((await runHandler(mpRequest(file))).calls.validation.length, 0);
+    // ... and a first header without one makes a text field, whatever a later one says.
+    const text = mpBody(twice('name="note"', 'name="doc"; filename="a"', 'a@x.com'));
+    assert.deepStrictEqual(validated((await runHandler(mpRequest(text), { status: 'valid' })).calls), ['a@x.com']);
+});
+
+test('R2: the first name parameter of a disposition wins for the part that is not a candidate', async () => {
+    const body = mpBody(field('email', 'q@x.com'), 'Content-Disposition: form-data; name="x"; name="email"\r\n\r\np@x.com');
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['q@x.com']);
+    assert.strictEqual(text, body);
+});
+
+test('R2: parameter names are case-insensitive, unquoted values are trimmed, quoted ones unescape', async () => {
+    // A second part carries the variant name; it must be read as an email field and rewritten.
+    for (const header of ['NAME="email"', 'Name=email', 'name=email ; x=y', 'name= email', 'x="a\\"; name=y"; name="email"', 'x="a;b"; name="email"', 'name="em\\ail"', 'name="email" ; x=y']) {
+        const body = mpBody(field('email', 'g@ok.example'), `Content-Disposition: form-data; ${header}\r\n\r\ne@bad.example`);
+        const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+        assert.strictEqual(calls.validation.length, 1, header);
+        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), `Content-Disposition: form-data; ${header}\r\n\r\nINVALID`), header);
+    }
+    // A header name is trimmed; its case does not matter.
+    const spaced = mpBody(field('email', 'g@ok.example'), 'content-disposition : form-data; name="email"\r\n\r\ne@bad.example');
+    assert.strictEqual((await runHandler(mpRequest(spaced), { status: 'valid' })).text, mpBody(field('email', 'g@ok.example'), 'content-disposition : form-data; name="email"\r\n\r\nINVALID'));
+});
+
+test('R2 bypass: the boundary parameter is parsed as a header parameter', async () => {
+    const body = rawMp('zb-b', field('email', 'g@ok.example'), field('your-email', 'e@bad.example'));
+    const fixed = rawMp('zb-b', field('email', 'g@ok.example'), field('your-email', 'INVALID'));
+    for (const type of [
+        'multipart/form-data; x="; boundary=A"; boundary=zb-b',
+        'multipart/form-data; x="a\\"; boundary=A"; boundary=zb-b',
+        'multipart/form-data; boundary="zb-b"',
+        'multipart/form-data;boundary=zb-b',
+        'multipart/form-data; BOUNDARY=zb-b; charset=utf-8',
+        'multipart/form-data; charset="a;b"; boundary=zb-b',
+    ]) {
+        const { calls, text } = await runHandler(multipartRequest(body, type), { status: 'valid' });
+        assert.strictEqual(calls.validation.length, 1, type);
+        assert.strictEqual(text, fixed, type);
+    }
+    // No usable boundary: nothing is read, the request is forwarded.
+    for (const type of ['multipart/form-data', 'multipart/form-data; boundary=', 'multipart/form-data; x="boundary=zb-b"']) {
+        const { calls, text } = await runHandler(multipartRequest(body, type), { status: 'valid' });
+        assert.strictEqual(calls.validation.length, 0, type);
+        assert.strictEqual(text, body, type);
+    }
+});
+
+test('R2 bypass: more than one boundary parameter is answered 400 by the Worker, with no origin call', async () => {
+    const body = rawMp('zb-b', field('email', 'g@ok.example'));
+    for (const type of ['multipart/form-data; boundary=zb-b; boundary=other', 'multipart/form-data; boundary=zb-b; BOUNDARY="zb-b"', 'multipart/form-data; boundary=a; x=y; boundary=']) {
+        const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+        const response = await worker.context.handleRequest(fetchEvent(multipartRequest(body, type)));
+        assert.strictEqual(response.status, 400, type);
+        assert.strictEqual(await response.text(), 'Bad Request');
+        assert.match(response.headers.get('content-type'), /^text\/plain/);
+        assert.strictEqual(worker.calls.forwarded.length, 0);
+        assert.strictEqual(worker.calls.validation.length, 0);
+        assert.strictEqual(worker.errors.length, 1);
+    }
+});
+
+test('R2 bypass: a delimiter line is the boundary and nothing else but blanks and a line break', async () => {
+    // "--zb-b-Z" inside a value is not a delimiter, so the fake part stays inside "note".
+    const note = field('note', 'x\r\n--zb-b-Z\r\nContent-Disposition: form-data; name="email"\r\n\r\ne@bad.example');
+    const body = mpBody(note, field('email', 'g@ok.example'));
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['g@ok.example']);
+    assert.strictEqual(text, body);
+
+    // Trailing spaces and tabs after the boundary, a bare LF, and a body that ends at the closing delimiter.
+    const variants = [
+        `--zb-b \t\r\n${field('email', 'g@ok.example')}\r\n--zb-b  \r\n${field('n', '1')}\r\n--zb-b--`,
+        `--zb-b\n${field('email', 'g@ok.example').replace(/\r\n/g, '\n')}\n--zb-b--\n`,
+        `--zb-b\r\n${field('email', 'g@ok.example')}\r\n--zb-b--`,
+        `preamble\r\n--zb-b\r\n${field('email', 'g@ok.example')}\r\n--zb-b--junk`,
+    ];
+    for (const variant of variants) {
+        const result = await runHandler(mpRequest(variant), { status: 'valid' });
+        assert.deepStrictEqual(validated(result.calls), ['g@ok.example'], JSON.stringify(variant));
+    }
+
+    // A bare CR is not a line break.
+    const cr = `--zb-b\r${field('email', 'g@ok.example')}\r\n--zb-b--\r\n`;
+    assert.strictEqual((await runHandler(mpRequest(cr), { status: 'valid' })).calls.validation.length, 0);
+});
+
+test('R2: nothing after the closing delimiter is read', async () => {
+    const epilogue = `--zb-b\r\n${field('n', '1')}\r\n--zb-b--\r\n--zb-b\r\n${field('email', 'e@bad.example')}\r\n--zb-b--\r\n`;
+    const { calls, text } = await runHandler(mpRequest(epilogue), { status: 'valid' });
+    assert.strictEqual(calls.validation.length, 0);
+    assert.strictEqual(text, epilogue);
+});
+
+test('R2: a part with no blank line after its headers has no value and is not read', async () => {
+    const body = mpBody('Content-Disposition: form-data; name="email"\r\nc@x.com');
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+    assert.strictEqual(calls.validation.length, 0);
+    assert.strictEqual(text, body);
+});
+
+test('R2 bypass: a candidate part with a transfer encoding is rewritten to INVALID when VALID_STATUS is set', async () => {
+    const qp = (name, value, encoding = 'quoted-printable') => disp(`name="${name}"`, value, `Content-Transfer-Encoding: ${encoding}\r\n`);
+    // Beside a validated address: still one validation, the encoded value goes.
+    for (const encoding of ['quoted-printable', 'base64', 'Base64', 'x-token']) {
+        const body = mpBody(field('email', 'g@ok.example'), qp('your-email', 'e=40bad.example', encoding));
+        const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], encoding);
+        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), qp('your-email', 'INVALID', encoding)), encoding);
+    }
+    // Alone: no validation call, rewritten all the same.
+    const alone = mpBody(qp('email', 'e=40bad.example'), field('note', 'hi'));
+    const result = await runHandler(mpRequest(alone), { status: 'valid' });
+    assert.strictEqual(result.calls.validation.length, 0);
+    assert.strictEqual(result.text, mpBody(qp('email', 'INVALID'), field('note', 'hi')));
+    // Identity encodings, other field names, an empty value, no VALID_STATUS and a failed validation leave it as it is.
+    for (const encoding of ['7bit', '8BIT', 'binary']) {
+        const body = mpBody(field('email', 'g@ok.example'), qp('your-email', 'g@ok.example', encoding));
+        assert.strictEqual((await runHandler(mpRequest(body), { status: 'valid' })).text, body, encoding);
+    }
+    const note = mpBody(field('email', 'g@ok.example'), qp('note', 'e=40bad.example'));
+    assert.strictEqual((await runHandler(mpRequest(note), { status: 'valid' })).text, note);
+    const empty = mpBody(field('email', 'g@ok.example'), qp('your-email', ''));
+    assert.strictEqual((await runHandler(mpRequest(empty), { status: 'valid' })).text, empty);
+    const body = mpBody(field('email', 'g@ok.example'), qp('your-email', 'e=40bad.example'));
+    assert.strictEqual((await runHandler(mpRequest(body), { status: 'valid', bindings: { VALID_STATUS: undefined } })).text, body);
+    assert.strictEqual((await runHandler(mpRequest(body), { status: 'valid', bindings: { API_KEY: 'bad key' } })).text, body);
+});
+
+test('R2 bypass: a transfer-encoded candidate part is never chosen as the address', async () => {
+    const body = mpBody(disp('name="email"', 'a@x.com', 'Content-Transfer-Encoding: base64\r\n'), field('contact', 'c@x.com'));
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['c@x.com']);
+    assert.strictEqual(text, mpBody(disp('name="email"', 'INVALID', 'Content-Transfer-Encoding: base64\r\n'), field('contact', 'c@x.com')));
+});
+
+// --- JSON -------------------------------------------------------------------
+
+function jsonRequest(form, extra = {}) {
+    return new Request('https://example.com/f', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ form: JSON.stringify(form), ...extra }),
+    });
+}
+
+test('R2 bypass: a JSON candidate key whose value is not a string is set to INVALID when VALID_STATUS is set', async () => {
+    for (const value of [123, ['a@x.com'], null, { a: 'b@x.com' }, true]) {
+        const alone = await runHandler(jsonRequest({ email: value, n: 1 }), { status: 'valid' });
+        assert.strictEqual(alone.calls.validation.length, 0);
+        assert.deepStrictEqual(JSON.parse(JSON.parse(alone.text).form), { email: 'INVALID', n: 1 });
+
+        const beside = await runHandler(jsonRequest({ email: value, 'your-email': 'g@ok.example' }), { status: 'valid' });
+        assert.deepStrictEqual(validated(beside.calls), ['g@ok.example']);
+        assert.deepStrictEqual(JSON.parse(JSON.parse(beside.text).form), { email: 'INVALID', 'your-email': 'g@ok.example' });
+
+        const unset = await runHandler(jsonRequest({ email: value }), { status: 'valid', bindings: { VALID_STATUS: undefined } });
+        assert.deepStrictEqual(JSON.parse(JSON.parse(unset.text).form), { email: value });
+    }
+    // Another key with a non-string value is not a candidate.
+    const other = await runHandler(jsonRequest({ email2: 5 }), { status: 'valid' });
+    assert.deepStrictEqual(JSON.parse(JSON.parse(other.text).form), { email2: 5 });
+});
+
+// --- small survivors --------------------------------------------------------
+
+test('R2: the media type is trimmed, and empty fields are skipped', async () => {
+    const trimmed = new Request('https://example.com/f', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded ; charset=utf-8' },
+        body: 'email=a%40x.com',
+    });
+    assert.strictEqual((await runHandler(trimmed)).text, 'email=INVALID');
+    const mp = new Request('https://example.com/f', {
+        method: 'POST',
+        headers: { 'content-type': 'multipart/form-data ; boundary=zb-b' },
+        body: mpBody(field('email', 'a@x.com')),
+    });
+    assert.strictEqual((await runHandler(mp)).text, mpBody(field('email', 'INVALID')));
+
+    const { calls, text } = await runHandler(formRequest('x=1&&&email=a%40x.com&&'), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['a@x.com']);
+    assert.strictEqual(text, 'x=1&&&email=a%40x.com&&');
+});
+
+test('R2: a value is trimmed before it is judged and before it is compared with the validated address', async () => {
+    const { calls, text } = await runHandler(formRequest('email=%20a%40x.com%20'), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['a@x.com']);
+    assert.strictEqual(text, 'email=%20a%40x.com%20');
+    const same = await runHandler(formRequest('email=a%40x.com&email=%20a%40x.com%20&your-email=%0Aa%40x.com'), { status: 'valid' });
+    assert.strictEqual(same.text, 'email=a%40x.com&email=%20a%40x.com%20&your-email=%0Aa%40x.com');
+});
+
+test('R2: the forwarded request keeps its URL, query string and method after a rewrite', async () => {
+    const request = formRequest('email=a%40x.com', { url: 'https://example.com/path/sub?x=1&y=%20z' });
+    const worker = await runHandler(request);
+    assert.strictEqual(worker.text, 'email=INVALID');
+    assert.strictEqual(worker.calls.forwarded[0].url, 'https://example.com/path/sub?x=1&y=%20z');
+    assert.strictEqual(worker.calls.forwarded[0].method, 'POST');
+});
+
+// --- errors -----------------------------------------------------------------
+
+test('R2: a 2xx error body names its message; a whitespace-only error string is not an error', async () => {
+    const answer = async (body, status = 200) => {
+        const { context } = loadWorker({ API_KEY });
+        context.fetch = async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+        const result = await context.validateEmail('a@x.com', null);
+        return typeof result === 'string' ? JSON.parse(result).message : result;
+    };
+    assert.strictEqual(await answer({ detail: 'the detail' }), 'the detail');
+    assert.strictEqual(await answer({ message: ' the message ' }), 'the message');
+    assert.strictEqual(await answer({ Message: 'M' }), 'M');
+    assert.strictEqual(await answer({ error_message: 'em' }), 'em');
+    assert.strictEqual(await answer({ Error: 'E', status: 'valid', address: 'a@x.com' }), 'E');
+    assert.strictEqual(await answer({ detail: '   ', message: 'second' }), 'second');
+    assert.strictEqual(await answer({ detail: 5 }), 'ZeroBounce returned no validation status.');
+    assert.strictEqual(await answer([{ error: 'inside' }]), 'ZeroBounce returned an unexpected response.');
+    assert.strictEqual(await answer('"text"'), 'ZeroBounce returned an unexpected response.');
+    assert.strictEqual(await answer('null'), 'ZeroBounce returned an unexpected response.');
+    assert.strictEqual(await answer({ detail: 'from a 500' }, 500), 'from a 500');
+    assert.strictEqual(await answer([1], 500), 'ZeroBounce returned an unexpected response.');
+    assert.strictEqual(await answer('not json', 500), 'ZeroBounce answered with HTTP 500');
+    // Whitespace-only error strings do not make a result an error.
+    for (const key of ['error', 'error_message', 'Error']) {
+        const result = await answer({ status: 'valid', address: 'a@x.com', [key]: '  \t ' });
+        assert.strictEqual(result.status, 'valid', key);
+    }
+});
+
+// --- KV, logs, redaction ----------------------------------------------------
+
+test('R2: KV key time fields are zero-padded, with no commas', async () => {
+    class FixedDate extends Date {
+        constructor() { super(2026, 0, 2, 3, 4, 5, 6); }
+    }
+    const kv = recordingKv();
+    const worker = loadWorker({ API_KEY, LOGS: kv.LOGS, Date: FixedDate });
+    const events = [];
+    worker.context.logValidation({ waitUntil: (p) => events.push(p) }, 'a@x.com', '/p', { status: 'valid' });
+    await Promise.all(events);
+    assert.strictEqual(kv.puts[0].key, '{2026-01-02}-{a@x.com}-{/p}-{03:04}-05.006');
+});
+
+test('R2: a LOGS.put that throws at once does not stop the request, and the rewrite still happens', async () => {
+    const throwing = { put: () => { throw new Error('boom'); } };
+    const worker = await runHandler(formRequest('email=a%40x.com&n=1'), { bindings: { LOGS: throwing }, status: 'invalid' });
+    assert.strictEqual(worker.text, 'email=INVALID&n=1');
+    assert.ok(worker.errors.some((line) => line.includes('boom')), worker.errors.join('\n'));
+
+    const notKv = await runHandler(formRequest('email=a%40x.com'), { bindings: { LOGS: 'not a namespace' }, status: 'invalid' });
+    assert.strictEqual(notKv.text, 'email=INVALID');
+    assert.ok(notKv.errors.length >= 1);
+});
+
+test('R2: a refused whitespace-only API_KEY is not used for masking', async () => {
+    for (const key of [' ', '   ', '\t', '\n ']) {
+        const worker = loadWorker({ API_KEY: key });
+        assert.strictEqual(worker.context.redactKey('a b\tc d'), 'a b\tc d', JSON.stringify(key));
+        const result = await worker.context.validateEmail('a@x.com', null);
+        assert.strictEqual(worker.calls.validation.length, 0);
+        assert.match(JSON.parse(result).error, /Invalid API_KEY/);
+        assert.ok(worker.errors.every((line) => line.includes('Invalid API_KEY')), worker.errors.join('\n'));
+    }
+});
+
+test('R2: log lines pass through the redaction', async () => {
+    const KEY = 'zb-dummy-key-0001';
+    const worker = loadWorker({ API_KEY: KEY, API_REGION: `moon-${KEY}` });
+    await worker.context.validateEmail('a@x.com', null);
+    assert.ok(worker.logs.some((line) => line.includes('Unknown API_REGION')));
+    for (const line of [...worker.logs, ...worker.errors]) assert.ok(!line.includes(KEY), line);
+
+    const bad = loadWorker({ API_KEY: KEY });
+    bad.context.logLine(`seen ${KEY}`);
+    bad.context.errorLine(`seen ${KEY}`);
+    assert.deepStrictEqual(bad.logs, ['seen ***']);
+    assert.deepStrictEqual(bad.errors, ['seen ***']);
+});
+
+test('R2: the KV key never carries the API key, in the address or the path part, and redaction comes before the cut', async () => {
+    const KEY = 'zb-dummy-key-0001';
+    const store = async (email, url) => {
+        const kv = recordingKv();
+        const worker = loadWorker({ API_KEY: KEY, LOGS: kv.LOGS });
+        const events = [];
+        worker.context.logValidation({ waitUntil: (p) => events.push(p) }, email, url, { status: 'valid' });
+        await Promise.all(events);
+        return kv.puts[0].key;
+    };
+    assert.ok(!(await store(`${KEY}@x.com`, '/p')).includes(KEY));
+    assert.ok((await store(`${KEY}@x.com`, '/p')).includes('***@x.com'));
+    assert.ok(!(await store('a@x.com', `/${KEY}`)).includes(KEY));
+    assert.ok((await store('a@x.com', `/${KEY}`)).includes('/***'));
+
+    // The key straddles the cut: found whole in the text, so masked before the text is cut.
+    for (const build of [(pad) => store(`${'a'.repeat(pad)}${KEY}@x.com`, '/p'), (pad) => store('a@x.com', `/${'p'.repeat(pad * 2)}${KEY}`)]) {
+        for (let pad = 150; pad < 300; pad += 1) {
+            const key = await build(pad);
+            assert.ok(!key.includes(KEY.slice(0, 8)), `pad ${pad}: ${key}`);
+        }
+    }
+});
+
+test('R2: a very long address cannot push the KV key over 512 bytes', async () => {
+    const kv = recordingKv();
+    const worker = loadWorker({ API_KEY, LOGS: kv.LOGS });
+    const events = [];
+    worker.context.logValidation({ waitUntil: (p) => events.push(p) }, `${'a'.repeat(600)}@x.com`, '/p', { status: 'valid' });
+    await Promise.all(events);
+    assert.ok(new TextEncoder().encode(kv.puts[0].key).length <= 512);
+    assert.match(kv.puts[0].key, /\}-\{\/p\}-\{\d\d:\d\d\}-\d\d\.\d{3}$/);
+});
+
+test('R2: a bare CR after the boundary is not a delimiter', async () => {
+    const body = `--zb-b\r\n${field('email', 'g@ok.example')}\r\n--zb-b\rjunk\r\n${field('your-email', 'e@bad.example')}\r\n--zb-b--\r\n`;
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+    // Everything up to the next real delimiter is one value, which is not an address.
+    assert.strictEqual(calls.validation.length, 0);
+    assert.strictEqual(text, body);
+});
+
+test('R2: a part without Content-Disposition is skipped, and white space around parameters is tolerated', async () => {
+    const noDisposition = 'Content-Type: text/plain\r\n\r\ne@bad.example';
+    const body = mpBody(noDisposition, field('email', 'g@ok.example'));
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['g@ok.example']);
+    assert.strictEqual(text, body);
+
+    for (const header of ['name ="email"', 'name= "email"', 'name = "email"', 'form-data;\tname="email"', 'x=1;   name="email"']) {
+        const variant = `Content-Disposition: form-data; ${header}\r\n\r\ne@bad.example`;
+        const result = await runHandler(mpRequest(mpBody(field('email', 'g@ok.example'), variant)), { status: 'valid' });
+        assert.strictEqual(result.text, mpBody(field('email', 'g@ok.example'), variant.replace('e@bad.example', 'INVALID')), header);
+    }
+});
+
+test('R2: nothing is forwarded as a modified request when nothing is rewritten', async () => {
+    const mp = mpBody(field('email', 'g@ok.example'));
+    const urlenc = 'email=g%40ok.example';
+    const json = jsonRequest({ email: 'g@ok.example' });
+    for (const request of [mpRequest(mp), formRequest(urlenc), json]) {
+        const { logs } = await runHandler(request, { status: 'valid' });
+        assert.ok(!logs.some((line) => line.includes('Returning modified request')));
+    }
+    for (const request of [mpRequest(mp), formRequest(urlenc), jsonRequest({ email: 'g@ok.example' })]) {
+        const { logs } = await runHandler(request, { status: 'invalid' });
+        assert.ok(logs.some((line) => line.includes('Returning modified request')));
+    }
+});
+
+test('R2: a transfer-encoded candidate part is left alone when VALID_STATUS is not set, even with no address elsewhere', async () => {
+    const body = mpBody(disp('name="email"', 'e=40bad.example', 'Content-Transfer-Encoding: quoted-printable\r\n'), field('note', 'hi'));
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid', bindings: { VALID_STATUS: undefined } });
+    assert.strictEqual(calls.validation.length, 0);
+    assert.strictEqual(text, body);
+    const json = await runHandler(jsonRequest({ email: 5 }), { status: 'valid', bindings: { VALID_STATUS: undefined } });
+    assert.deepStrictEqual(JSON.parse(JSON.parse(json.text).form), { email: 5 });
+});
+
+test('R2: a trailing comma and the space before it are dropped from a typed entry', async () => {
+    const { text } = await runHandler(formRequest('email=a%40x.com'), { bindings: { VALID_STATUS: ['valid ,'] }, status: 'valid' });
+    assert.strictEqual(text, 'email=a%40x.com');
 });

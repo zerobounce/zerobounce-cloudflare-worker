@@ -10,30 +10,25 @@
  */
 
 /**
- * Community based email regex, heavily modified to our needs. It is applied only
- * to one decoded, trimmed form value at a time (see regexFormValue), never to a
- * whole body.
- * DO NOT EDIT!
- * ------------
- - allows Latin characters ("a" - "z" or "A" - "Z") within the email address.
- - permits digits (0 - 9) in the email address.
- - enforces domain part restrictions.
- - allows hyphens (-) inside the domain as long as they don't lead or trail the domain.
- - allows IP address literals surrounded with square brackets ([]) for the domain names.
- - restricts sub-domains to a maximum length of 63 characters.
- - applies local part restrictions.
- - permits the set of special characters allowed by RFC 5322 ("!", "#", "$", "%", "&", "'", "*", "+", "-", "/", "=", "?", "^", "_", "`", "{", "|", "}", "~”) to reside in the local part.
- - lets local part comprise as double quotes housing one or more sequences of ASCII characters.
- - doesn't allow trailing, leading, or consecutive periods anywhere within the email address.
- - doesn't allow Unicode characters.
- - doesn't check for the entire length of the email address to be less than or equal to 253 characters.
- - ignores obsolete syntax-related rules.
- */
-
-/**
- * Similar to the above.
- * DO NOT EDIT!
- * ------------
+ * The email address pattern: a community-based expression, heavily modified to
+ * our needs, written as a string. It is applied only to one decoded, trimmed
+ * form value at a time (see regexFormValue), never to a whole body. The string
+ * keeps the "(.*=)" prefix and "&" suffix of the form-body pattern it came
+ * from; regexFormValue cuts them off.
+ * What the address part accepts:
+ - Latin characters ("a" - "z" or "A" - "Z") within the email address.
+ - digits (0 - 9) in the email address.
+ - domain part restrictions are enforced.
+ - hyphens (-) inside the domain as long as they don't lead or trail the domain.
+ - IP address literals surrounded with square brackets ([]) for the domain names.
+ - sub-domains are restricted to a maximum length of 63 characters.
+ - local part restrictions apply.
+ - the set of special characters allowed by RFC 5322 ("!", "#", "$", "%", "&", "'", "*", "+", "-", "/", "=", "?", "^", "_", "`", "{", "|", "}", "~") may reside in the local part.
+ - the local part may be double quotes housing one or more sequences of ASCII characters.
+ - no trailing, leading, or consecutive periods anywhere within the email address.
+ - no Unicode characters.
+ - the length of the entire address is not checked here (isAddress caps it at 320 characters).
+ - obsolete syntax-related rules are ignored.
  */
 const regex2 = '(.*=)(([-!#-\'*+\\/-9=?A-Z^-~]+(\\.[-!#-\'*+\\/-9=?A-Z^-~]+)*|"([]!#-[^-~ \\t]|(\\\\[\\t -~]))+")@([0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?(\\.[0-9A-Za-z]([0-9A-Za-z-]{0,61}[0-9A-Za-z])?)*|\\[((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|IPv6:((((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){6}|::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){5}|[0-9A-Fa-f]{0,4}::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){4}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):)?(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){3}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,2}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){2}|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,3}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,4}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,5}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3})|(((0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}):){0,6}(0|[1-9A-Fa-f][0-9A-Fa-f]{0,3}))?::)|(?!IPv6:)[0-9A-Za-z-]*[0-9A-Za-z]:[!-Z^-~]+)]))&';
 
@@ -146,10 +141,20 @@ function mediaType(contentType) {
     return String(contentType).split(';')[0].trim().toLowerCase();
 }
 
-/** The boundary parameter of a multipart Content-Type header, or null. */
+/**
+ * The boundary of a multipart Content-Type header: {boundary, ambiguous}. The
+ * parameters are parsed as a header does (a token or a quoted string with
+ * backslash escapes), so a "boundary=" inside a quoted value is not a
+ * parameter. More than one boundary parameter is ambiguous: parsers disagree
+ * on which one wins, so the Worker refuses the request (400) rather than read
+ * the body one way while the origin reads it another.
+ */
 function multipartBoundary(contentType) {
-    const match = /;\s*boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType));
-    return match ? (match[1] || match[2]) : null;
+    const found = headerParameterList(String(contentType)).filter(([name]) => name === 'boundary');
+    return {
+        boundary: found.length === 1 && found[0][1] !== '' ? found[0][1] : null,
+        ambiguous: found.length > 1,
+    };
 }
 
 /** The index of the first occurrence of `pattern` in `bytes` at or after `from`, or -1. */
@@ -167,12 +172,13 @@ function indexOfBytes(bytes, pattern, from = 0, to = bytes.length) {
 }
 
 /**
- * The parameters of a Content-Disposition header value as {name: value} (names
- * in lower case): a linear scan that honours quoted strings, so a filename
- * that merely contains `name="email"` does not set the field name.
+ * The parameters of a header value (the text after the first ";") as a list of
+ * [name, value] in order, names in lower case: a linear scan that honours
+ * quoted strings (with backslash escapes), so a filename that merely contains
+ * `name="email"` does not set the field name.
  */
-function headerParameters(text) {
-    const params = {};
+function headerParameterList(text) {
+    const params = [];
     let i = text.indexOf(';');
     while (i !== -1 && i < text.length) {
         i += 1; // past ';'
@@ -199,8 +205,19 @@ function headerParameters(text) {
                 value = text.slice(valueStart, i).trim();
             }
         }
-        if (paramName && !Object.prototype.hasOwnProperty.call(params, paramName)) {
-            params[paramName] = value;
+        if (paramName) {
+            params.push([paramName, value]);
+        }
+    }
+    return params;
+}
+
+/** The parameters of a header value as {name: value}; the first of a repeated name wins. */
+function headerParameters(text) {
+    const params = {};
+    for (const [name, value] of headerParameterList(text)) {
+        if (!Object.prototype.hasOwnProperty.call(params, name)) {
+            params[name] = value;
         }
     }
     return params;
@@ -211,26 +228,43 @@ function isAsciiSpace(byte) {
     return byte === 0x20 || byte === 0x09 || byte === 0x0d || byte === 0x0a;
 }
 
+/** The transfer encodings that leave a part's bytes as the sender wrote them. */
+const IDENTITY_ENCODINGS = ['7bit', '8bit', 'binary'];
+
 /**
- * The text fields of a multipart body, without decoding the body as text. Each
- * is {name, value, valueStart, end}: the decoded field name, the value with
- * surrounding space, tab, CR and LF removed, and the byte span of that value
- * (so a replacement keeps the whitespace around it). A part is found by its
- * delimiter line and read header by header up to the first blank line (CRLF or
- * bare LF); a part with a filename (or a filename*) is a file and is skipped:
- * its bytes, binary or not, are never read as an address and never rewritten.
- * No regular expression runs over body bytes here, so the cost is linear.
+ * The fields of a multipart body, without decoding the body as text. Each is
+ * {name, value, valueStart, end, opaque}: the decoded field name, the value
+ * with surrounding space, tab, CR and LF removed, and the byte span of that
+ * value (so a replacement keeps the whitespace around it). A part is found by
+ * its delimiter line and read header by header up to the first blank line
+ * (CRLF or bare LF). A delimiter line is "--boundary" followed only by spaces
+ * or tabs and a line break, or by "--" (the closing delimiter, after which
+ * everything is epilogue and never read).
+ *
+ * A part with a filename (or a filename*) is a file and is skipped, its bytes
+ * never read as an address and never rewritten, unless its name is one an
+ * origin reads as an email field (see isEmailFieldName): PHP lists a part named
+ * `email` with a bare `filename` among its text fields. When a part repeats
+ * Content-Disposition, it is a candidate if any of them names one; the first
+ * supplies the name and filename otherwise. A candidate part with a transfer
+ * encoding other than 7bit, 8bit or binary (quoted-printable, base64) is
+ * `opaque`: its value is not what an origin that decodes it would read, so it
+ * cannot be validated. No regular expression runs over body bytes here, so the
+ * cost is linear.
  */
 function multipartFields(bytes, boundary) {
     const LF = 0x0a;
     const CR = 0x0d;
     const dashes = textToBuffer(`--${boundary}`);
-    // A delimiter is "--boundary" at the start of a line, followed by space,
-    // tab, a line break or "--"; CRLF is the standard break and a bare LF is
-    // accepted as well.
+    const isBlank = (byte) => byte === 0x20 || byte === 0x09;
     const delimiterAt = (index) => {
-        const after = bytes[index + dashes.length];
-        return after === undefined || after === CR || after === LF || after === 0x20 || after === 0x09 || after === 0x2d;
+        const after = index + dashes.length;
+        if (bytes[after] === 0x2d && bytes[after + 1] === 0x2d) {
+            return true;
+        }
+        let i = after;
+        while (isBlank(bytes[i])) i++;
+        return bytes[i] === LF || (bytes[i] === CR && bytes[i + 1] === LF);
     };
     const lineStart = textToBuffer(`\n--${boundary}`);
     const nextDelimiter = (from) => {
@@ -268,7 +302,8 @@ function multipartFields(bytes, boundary) {
         // Headers, up to the first blank line.
         let position = start;
         let bodyStart = -1;
-        let disposition = null;
+        const dispositions = [];
+        let encoded = false;
         while (position < end) {
             const lf = bytes.indexOf(LF, position);
             if (lf === -1 || lf >= end) {
@@ -281,17 +316,24 @@ function multipartFields(bytes, boundary) {
             }
             const line = bufferToText(bytes.subarray(position, lineStop));
             const colon = line.indexOf(':');
-            if (colon !== -1 && disposition === null && line.slice(0, colon).trim().toLowerCase() === 'content-disposition') {
-                disposition = line.slice(colon + 1);
+            if (colon !== -1) {
+                const header = line.slice(0, colon).trim().toLowerCase();
+                if (header === 'content-disposition') {
+                    dispositions.push(line.slice(colon + 1));
+                } else if (header === 'content-transfer-encoding' && !IDENTITY_ENCODINGS.includes(line.slice(colon + 1).trim().toLowerCase())) {
+                    encoded = true;
+                }
             }
             position = lf + 1;
         }
-        if (bodyStart === -1 || disposition === null) {
+        if (bodyStart === -1 || dispositions.length === 0) {
             continue;
         }
 
-        const params = headerParameters(disposition);
-        if (Object.prototype.hasOwnProperty.call(params, 'filename') || Object.prototype.hasOwnProperty.call(params, 'filename*')) {
+        const parsed = dispositions.map(headerParameters);
+        const candidate = parsed.find((params) => Object.prototype.hasOwnProperty.call(params, 'name') && isEmailFieldName(params.name));
+        const first = parsed[0];
+        if (!candidate && (Object.prototype.hasOwnProperty.call(first, 'filename') || Object.prototype.hasOwnProperty.call(first, 'filename*'))) {
             continue;
         }
 
@@ -300,18 +342,42 @@ function multipartFields(bytes, boundary) {
         while (valueStart < valueEnd && isAsciiSpace(bytes[valueStart])) valueStart++;
         while (valueEnd > valueStart && isAsciiSpace(bytes[valueEnd - 1])) valueEnd--;
         fields.push({
-            name: Object.prototype.hasOwnProperty.call(params, 'name') ? params.name : '',
+            name: candidate ? candidate.name : (Object.prototype.hasOwnProperty.call(first, 'name') ? first.name : ''),
             value: bufferToText(bytes.subarray(valueStart, valueEnd)),
             valueStart,
             end: valueEnd,
+            opaque: Boolean(candidate) && encoded,
         });
     }
 
     return fields;
 }
 
-/** The field names the Worker reads first, in order. */
-const EMAIL_FIELD_NAMES = ['email', 'your-email'];
+/**
+ * The field names the Worker reads, in order of preference. A name counts the
+ * way an origin such as PHP reads it (see phpFieldName), so "your.email" and
+ * " email" are candidates and "?email" is not.
+ */
+const EMAIL_FIELD_NAMES = ['email', 'your-email', 'your_email'];
+
+/**
+ * A field name as PHP names the variable: cut at the first NUL, leading
+ * whitespace dropped, then every space and "." read as "_". The name is already
+ * percent-decoded (url-encoded body) or as written (multipart).
+ */
+function phpFieldName(name) {
+    let text = String(name);
+    const nul = text.indexOf('\0');
+    if (nul !== -1) {
+        text = text.slice(0, nul);
+    }
+    return text.replace(/^\s+/, '').replace(/[ .]/g, '_');
+}
+
+/** Whether an origin reads a field of this name as email, your-email or your_email. */
+function isEmailFieldName(name) {
+    return EMAIL_FIELD_NAMES.includes(phpFieldName(name));
+}
 
 /** An address longer than this cannot be one (RFC 5321 allows 254). */
 const MAX_ADDRESS_LENGTH = 320;
@@ -324,37 +390,45 @@ function isAddress(value) {
 
 /**
  * Picks the address to validate among the fields of a form: the first field
- * named `email` whose value is an address, then the same for `your-email`;
- * when no such field holds one, the first field whose whole value is an
- * address. Returns {field, named} or null.
+ * named `email` whose value is an address, then the same for `your-email` and
+ * `your_email` (names as an origin reads them, see phpFieldName); when no such
+ * field holds one, the first field whose whole value is an address. A field
+ * that cannot be read (`opaque`) is never chosen. Returns {field, named} or null.
  */
 function chooseAddressField(fields) {
+    const readable = fields.filter((f) => !f.opaque);
     for (const name of EMAIL_FIELD_NAMES) {
-        const field = fields.find((f) => f.name === name && isAddress(f.value));
+        const field = readable.find((f) => phpFieldName(f.name) === name && isAddress(f.value));
         if (field) {
             return { field, named: true };
         }
     }
-    const field = fields.find((f) => isAddress(f.value));
+    const field = readable.find((f) => isAddress(f.value));
     return field ? { field, named: false } : null;
 }
 
 /**
- * The fields to rewrite once the chosen address is validated. Only one address
- * costs a validation credit, so any other value of a candidate field (every
- * repeat, and the other of `email` / `your-email`) would reach the origin
+ * The fields to rewrite once the chosen address is validated (`chosen` is null
+ * when there is none). Only one address costs a validation credit, so any other
+ * value of a candidate field (every repeat, and the other of `email` /
+ * `your-email`, however the origin would spell the name) would reach the origin
  * unvalidated: it is rewritten too when it differs from the validated address,
  * whatever the status. A rejected address rewrites every candidate value. The
- * candidates are the two named fields, or, when the address was found in a
- * field with another name, every field of that name. Empty values stay.
+ * candidates are the named fields, or, when the address was found in a field
+ * with another name, every field that reads as that name. Empty values stay.
+ * An `opaque` field (a value that cannot be read) is always rewritten.
  */
 function fieldsToRewrite(fields, chosen, rejected) {
-    const address = chosen.field.value.trim();
-    return fields.filter((f) => (
-        (chosen.named ? EMAIL_FIELD_NAMES.includes(f.name) : f.name === chosen.field.name) &&
-        f.value.trim() !== '' &&
-        (rejected || f.value.trim() !== address)
-    ));
+    const address = chosen ? chosen.field.value.trim() : '';
+    return fields.filter((f) => {
+        if (f.opaque) {
+            return f.forced || f.value.trim() !== '';
+        }
+        return chosen !== null &&
+            (chosen.named ? isEmailFieldName(f.name) : phpFieldName(f.name) === phpFieldName(chosen.field.name)) &&
+            f.value.trim() !== '' &&
+            (rejected || f.value.trim() !== address);
+    });
 }
 
 /** Workers KV keys are at most 512 bytes of UTF-8. */
@@ -380,17 +454,26 @@ function truncateUtf8(text, maxBytes) {
  * Logs validations into the Worker KV Namespace
  */
 function logValidation(event, email, url, result) {
-    if (typeof LOGS !== 'undefined') {
-        const pad = (n, s = 2) => (`${new Array(s).fill(0)}${n}`).slice(-s);
+    if (typeof LOGS === 'undefined') {
+        return;
+    }
+    // A failure to log (LOGS is not a KV namespace, put throws at once) must
+    // never stop the request: it is reported, and the submission carries on.
+    try {
+        const pad = (n, size = 2) => String(n).padStart(size, '0');
         const d = new Date();
         const redactString = (key, value) => (typeof value === 'string' ? redactKey(value) : value);
 
         // The key is "{date}-{email}-{url}-{time}-{seconds.ms}". KV keys are at most
         // 512 bytes, so an address and a path that would not fit are cut (the date
-        // in front and the time behind stay, so keys remain unique and sortable).
-        const head = `{${pad(d.getFullYear(),4)}-${pad(d.getMonth()+1)}-${pad(d.getDate())}}-{`;
-        const tail = `}-{${pad(d.getHours())}:${pad(d.getMinutes())}}-${pad(d.getSeconds())}.${pad(d.getMilliseconds(),3)}`;
+        // in front and the time behind stay). The key is sortable by date; two
+        // validations of one address and path within the same millisecond would
+        // write the same key, and the later one replaces the earlier.
+        const head = `{${pad(d.getFullYear(), 4)}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}}-{`;
+        const tail = `}-{${pad(d.getHours())}:${pad(d.getMinutes())}}-${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
         const room = KV_KEY_MAX_BYTES - new TextEncoder().encode(head + tail + '}-{').length;
+        // Redacted first, then cut: a key straddling the cut would otherwise
+        // leave its first half in the stored key.
         const emailPart = truncateUtf8(redactKey(email), Math.floor(room / 2));
         const urlPart = truncateUtf8(redactKey(url), room - new TextEncoder().encode(emailPart).length);
         const key = `${head}${emailPart}}-{${urlPart}${tail}`;
@@ -405,6 +488,8 @@ function logValidation(event, email, url, result) {
         // The waitUntil function allows us to continue performing work in our Cloudflare Worker, without blocking.
         // Every string is redacted before it is stored, so the API key never reaches KV.
         event.waitUntil(LOGS.put(key, value));
+    } catch (err) {
+        errorLine(`Unable to write the validation log to KV: ${err && err.message ? err.message : String(err)}`);
     }
 }
 
@@ -467,7 +552,11 @@ function validationEndpoint() {
  */
 const DEFAULT_API_TIMEOUT_MS = 10000;
 
-/** The longest API_TIMEOUT accepted: ten minutes, far beyond any Worker's wall-clock budget. */
+/**
+ * The longest API_TIMEOUT accepted: ten minutes. Cloudflare sets no hard
+ * duration limit on an HTTP Worker (its limit is CPU time), but the visitor's
+ * request waits as long as the validation does, so a longer timeout is not useful.
+ */
 const MAX_API_TIMEOUT_MS = 600000;
 
 /**
@@ -793,6 +882,11 @@ function redactKey(text) {
         return value;
     }
     const key = String(API_KEY);
+    // A key of only white space is refused as a key (apiKeyRejected), and
+    // masking it would hide every space in every log line.
+    if (key.trim() === '') {
+        return value;
+    }
     // Composed from the encoders a body can apply: the raw key and each one-
     // or two-step JSON quoting of it (a body quoting a JSON copy of the key,
     // and a JSON copy of that quote), with or without "/" escaped as "\/" at
@@ -1048,33 +1142,53 @@ async function validateEmail(email, ip_address) {
 }
 
 /**
- * A binding that holds a list (VALID_STATUS, BYPASS_PATH) as an array of
- * strings. A string binding is read as JSON when it is a JSON array
- * (`["valid", "catch-all"]`) and otherwise as a single entry; a blank string
- * is no list. Returns null when the binding is not set, or holds no usable
- * list, in which case the problem is logged (once per request).
+ * The entries of a text list binding, whatever way it was typed. In this order:
+ * a JSON array of strings (`["valid", "catch-all"]`); else, if the text holds
+ * quotes, every single- or double-quoted token (the form zerobounce.net's
+ * guide shows: `['valid', 'catch-all', 'unknown']`, `'/login,' '/logout,'`);
+ * else the text split on commas and white space (`valid,catch-all`, or one
+ * entry). Always: each entry trimmed, trailing commas stripped, empties dropped.
  */
-function bindingList(name, value) {
+function listEntries(text) {
+    if (text.startsWith('[')) {
+        try {
+            const parsed = JSON.parse(text);
+            if (Array.isArray(parsed)) {
+                return parsed;
+            }
+        } catch (err) {
+            // Not JSON: read it as a quoted or comma-separated list.
+        }
+    }
+    if (/['"]/.test(text)) {
+        return [...text.matchAll(/'([^']*)'|"([^"]*)"/g)].map((match) => (match[1] !== undefined ? match[1] : match[2]));
+    }
+    return text.split(/[,\s]+/);
+}
+
+/**
+ * A binding that holds a list (VALID_STATUS, BYPASS_PATH) as an array of
+ * non-empty strings. A typed array is used as it is; a text is read by
+ * listEntries. With `lower`, every entry is lower-cased (statuses are compared
+ * case-insensitively; paths match exactly). Returns null when the binding is
+ * not set, or holds no usable entry, in which case the problem is logged (once
+ * per request).
+ */
+function bindingList(name, value, lower = false) {
     if (value === undefined || value === null) {
         return null;
     }
-    let list = value;
-    if (typeof value === 'string') {
-        const text = value.trim();
-        if (text === '') {
-            return null;
-        }
-        list = [text];
-        if (text.startsWith('[')) {
-            try {
-                list = JSON.parse(text);
-            } catch (err) {
-                // Not JSON: one entry that happens to start with "[".
-            }
-        }
+    const entries = typeof value === 'string' ? listEntries(value.trim()) : value;
+    if (!Array.isArray(entries) || entries.some((item) => typeof item !== 'string')) {
+        logLine(`Ignoring ${name}: it must be a list of strings (a JSON array is preferred).`);
+        return null;
     }
-    if (!Array.isArray(list) || list.some((item) => typeof item !== 'string')) {
-        logLine(`Ignoring ${name}: it must be a JSON array of strings, or a single string.`);
+    const list = entries
+        .map((item) => item.trim().replace(/,+$/, '').trim())
+        .filter((item) => item !== '')
+        .map((item) => (lower ? item.toLowerCase() : item));
+    if (list.length === 0) {
+        logLine(`Ignoring ${name}: it holds no entry.`);
         return null;
     }
     return list;
@@ -1136,7 +1250,7 @@ async function handleRequest(event) {
 
         // Read once per request, so a malformed binding is logged once.
         const bypassPath = bindingList('BYPASS_PATH', typeof BYPASS_PATH === 'undefined' ? undefined : BYPASS_PATH);
-        const validStatus = bindingList('VALID_STATUS', typeof VALID_STATUS === 'undefined' ? undefined : VALID_STATUS);
+        const validStatus = bindingList('VALID_STATUS', typeof VALID_STATUS === 'undefined' ? undefined : VALID_STATUS, true);
 
         if (bypassPath !== null && bypassPath.includes(pathname)) {
             logLine(`BYPASS_PATH set for: ${pathname}. Returning original request.`);
@@ -1150,10 +1264,17 @@ async function handleRequest(event) {
                 // The body is read part by part and never decoded or
                 // re-encoded as a whole: file parts reach the origin byte for
                 // byte, and a rejected address is replaced in place.
+                const { boundary, ambiguous } = multipartBoundary(contentType);
+                if (ambiguous) {
+                    // Parsers disagree on which of two boundaries wins, so the
+                    // body cannot be read the way the origin will read it.
+                    errorLine('Refusing a multipart request whose Content-Type has more than one boundary parameter.');
+                    return new Response('Bad Request', { status: 400, headers: { 'content-type': 'text/plain' } });
+                }
                 const _body = new Uint8Array(await request.clone().arrayBuffer());
-                const boundary = multipartBoundary(contentType);
                 const fields = boundary ? multipartFields(_body, boundary) : [];
                 const chosen = chooseAddressField(fields);
+                let targets = [];
 
                 if (chosen !== null) {
                     const email = chosen.field.value.trim();
@@ -1162,16 +1283,20 @@ async function handleRequest(event) {
                     const outcome = await validateAddress(event, email, pathname, clientIP, validStatus);
 
                     if (outcome !== null && outcome.rewrite) {
-                        const targets = fieldsToRewrite(fields, chosen, outcome.rejected);
-
-                        if (targets.length > 0) {
-                            // Change body
-                            return await forwardWithBody(request, replaceFieldValues(_body, targets, 'INVALID'));
-                        }
+                        targets = fieldsToRewrite(fields, chosen, outcome.rejected);
                     }
                 } else {
                     // Never log the body itself: it can hold passwords and other form fields.
                     logLine(`Unable to find an email match in a multipart body of ${_body.byteLength} bytes.`);
+                    if (validStatus !== null) {
+                        // Only a part that cannot be read (transfer-encoded) is left.
+                        targets = fieldsToRewrite(fields, null, true);
+                    }
+                }
+
+                if (targets.length > 0) {
+                    // Change body
+                    return await forwardWithBody(request, replaceFieldValues(_body, targets, 'INVALID'));
                 }
 
                 // Return original request untouched
@@ -1235,10 +1360,15 @@ async function handleRequest(event) {
                 if (_form && typeof _form === 'object' && !Array.isArray(_form)) {
                     // Only the keys "email" and "your-email", exactly: another
                     // field (email_password, emailConfirm) is not an address.
-                    const fields = EMAIL_FIELD_NAMES
+                    // A value that is not a string cannot be validated; it is
+                    // opaque, and is set to "INVALID" when VALID_STATUS is set.
+                    const fields = ['email', 'your-email']
                         .filter((name) => Object.prototype.hasOwnProperty.call(_form, name))
-                        .map((name) => ({ name, value: typeof _form[name] === 'string' ? _form[name] : '' }));
+                        .map((name) => (typeof _form[name] === 'string'
+                            ? { name, value: _form[name] }
+                            : { name, value: '', opaque: true, forced: true }));
                     const chosen = chooseAddressField(fields);
+                    let targets = [];
 
                     if (chosen !== null && chosen.named) {
                         const email = chosen.field.value.trim();
@@ -1247,21 +1377,24 @@ async function handleRequest(event) {
                         const outcome = await validateAddress(event, email, pathname, clientIP, validStatus);
 
                         if (outcome !== null && outcome.rewrite) {
-                            const targets = fieldsToRewrite(fields, chosen, outcome.rejected);
-
-                            if (targets.length > 0) {
-                                for (const target of targets) {
-                                    _form[target.name] = "INVALID";
-                                }
-
-                                _body.form = JSON.stringify(_form);
-
-                                // Change body
-                                return await forwardWithBody(request, JSON.stringify(_body));
-                            }
+                            targets = fieldsToRewrite(fields, chosen, outcome.rejected);
                         }
                     } else {
                         logLine(`Unable to find an email match in a JSON body with ${Object.keys(_form).length} form fields.`);
+                        if (validStatus !== null) {
+                            targets = fieldsToRewrite(fields, null, true);
+                        }
+                    }
+
+                    if (targets.length > 0) {
+                        for (const target of targets) {
+                            _form[target.name] = "INVALID";
+                        }
+
+                        _body.form = JSON.stringify(_form);
+
+                        // Change body (re-serialised: number spelling and white space may change)
+                        return await forwardWithBody(request, JSON.stringify(_body));
                     }
                 }
 
