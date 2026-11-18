@@ -36,16 +36,19 @@ binding is optional: when one is missing the Worker falls back to forwarding the
 | `LOGS` | KV namespace | — | When bound, every validation result is written to it. |
 
 Set `VALID_STATUS` and `BYPASS_PATH` as JSON variables. A JSON array of strings is preferred, and it is read first.
-Other forms are accepted too:
+The forms in the zerobounce.net integration guide work too, with straight or curly quotes:
+`[‘valid’, ‘catch-all’, ‘unknown’]` and `‘/login,’ ‘/logout,’ ‘/connect,’ ‘/signing’`.
 
-- A quoted list, such as `['valid', 'catch-all', 'unknown']` or `'/login,' '/logout,'`. This is the form the
-  zerobounce.net integration guide shows. Every quoted entry is used.
-- A comma-separated list, such as `valid,catch-all`. Commas and whitespace both separate entries.
-- A single entry, such as `/wp-login.php`.
+If the text is not a JSON array of strings, the Worker ignores every bracket and every quote mark (straight, curly or
+angle). It then splits the rest on commas, semicolons, pipes and spaces. So `valid,catch-all`, `valid;catch-all`,
+`valid|catch-all`, `[valid, catch-all]` and `valid, 'catch-all'` all give two entries. A single entry, such as
+`/wp-login.php`, is one entry. Empty entries are dropped.
 
-Each entry is trimmed. A trailing comma and an empty entry are dropped. Statuses are compared without regard to case.
-Paths are compared whole: `/wp-login.php` does not match `/wp-login.php5` or `/blog/wp-login.php`. A value with no
-usable entry counts as not set. It is logged once per request and otherwise ignored.
+Statuses are compared without regard to case. A `VALID_STATUS` entry that is not one of the seven statuses the API
+returns (for example `catch_all`) is logged as "Ignoring unknown status" once per request, and is not used. If no entry
+is left, `VALID_STATUS` counts as not set, and that is logged too. Paths are compared whole: `/wp-login.php` does not
+match `/wp-login.php5` or `/blog/wp-login.php`. A `BYPASS_PATH` with no usable entry counts as not set. It is logged
+once per request and otherwise ignored.
 
 ### Validation statuses
 
@@ -61,52 +64,70 @@ API error), the submission is forwarded to your origin unvalidated, exactly as i
 failure is logged with `console.error` (visible in Workers Logs and `wrangler tail`), naming the cause and the API's own
 message, so a dead key does not go unnoticed; when `LOGS` is bound, the same failure is stored there instead of
 the API's raw answer. The stored value is one JSON text, `{"error": ..., "message": ...}`, not a JSON string inside a
-JSON string. The KV key starts with the date and is at most 512 bytes of UTF-8; a longer key is cut without splitting a
-character. A missing or refused `API_KEY` is recorded the same way. The API key itself is never logged or stored. The validation request does not follow redirects,
-since its URL carries the key.
+JSON string. The KV key is built from the date, the address and the path (it starts with `{` and the date). It is at
+most 512 bytes of UTF-8; a longer key is cut without splitting a character. A missing or refused `API_KEY` is recorded
+the same way. The API key itself is never logged or stored. The validation request does not follow redirects, since its
+URL carries the key.
 
 The Worker logs which address it validated and the result, but never a submitted form body, which can hold passwords.
 
 ### Which field is validated
 
-The Worker makes one validation call per request in which it finds an address, so such a request costs one credit.
+The Worker makes at most one validation call per request, so a request costs at most one credit. A call that
+fails gives no result and is not counted.
 
-Field names are matched the way PHP reads them. A name is percent-decoded, `+` is read as a space, leading whitespace is
-dropped, and a space or `.` is read as `_`. A field counts as an email field when its name comes out as `email`,
-`your-email` or `your_email`. So `your.email`, `your email` and `%20email` count. `?email` does not, because PHP keeps
-the `?`.
+**Email fields.** An email field is any field whose name contains `email`, in any letter case: `email`, `your-email`,
+`Email2`, `billing_email_address`. For a URL-encoded form the name is read both as sent and after percent-decoding
+(`+` read as a space). In a multipart form it is a part whose headers mention `email`. In the JSON branch it is a key
+that contains `email`. The Worker does not try to copy the way an origin parses field names. Odd spellings such as
+`your.email` or `email[]` are covered because they still contain `email`.
 
-In a URL-encoded form the Worker validates the email field. If there is no such field, or its value is not an email
-address, it validates the first field whose value is an email address.
+**Which address is validated.** The value of an email field counts as an address when it is a whole email address
+(at most 320 characters, surrounding whitespace ignored). The Worker picks one address:
 
-In a multipart form the Worker first looks at the part named like an email field. A part named like one is read even if
-it has a `filename`, because PHP reads it as a text field. If there is none, the Worker takes the first text part whose
-whole value is an email address. Any other part with a `filename` is a file part and is never read or changed. A part
-with no `filename` is a text field, even when its `Content-Type` is binary, such as `application/octet-stream`. A part
-with its own `Content-Type: text/plain` is still a text field. If a part has two `Content-Disposition` headers, the
-part counts as an email field when either one names an email field. Only the value bytes are replaced; the whitespace
+1. The first email field named exactly `email`, `your-email` or `your_email` whose value is an address.
+2. Otherwise the first email field whose value is an address.
+3. Otherwise, as a fallback, the first field whose value is an address, whatever its name.
+
+A value that is not an address is never sent to ZeroBounce.
+
+**What is rewritten.** This only happens when `VALID_STATUS` is set.
+
+- If the status is outside `VALID_STATUS`, every email field that holds an address becomes `INVALID`, and so does the
+  chosen field.
+- If the status is accepted, every email field that holds a different address becomes `INVALID`. Addresses are
+  compared without regard to case and surrounding whitespace.
+- In the fallback case the same rule applies to email fields. Repeats of the chosen field's name are handled as
+  before: a repeated value that differs from the validated one becomes `INVALID`.
+- If the validation gives no status (fail open), or `VALID_STATUS` is not set, the body is not touched.
+
+So your origin never receives an unvalidated address in an email field. The trade-off: a form that has a second,
+different address field on purpose (a friend's email, a CC) gets that field rewritten to `INVALID`. Such a form should
+use `BYPASS_PATH`, or name that field without the word `email`.
+
+**Multipart forms.** A part is an email field when its header block (all header lines, folded lines included) mentions
+`email`, whatever the `Content-Disposition` looks like. If there is no such part, the Worker takes the first text part
+whose whole value is an address. A file part (a part with a non-empty `filename`) is not read, unless its headers
+mention `email`. Then it is treated like any email field, and rewritten only if its value is an address. A part with no
+`filename` is a text field, even when its `Content-Type` is binary. Only the value bytes are replaced; the whitespace
 around them stays.
-
-A multipart `Content-Type` is parsed as a header with parameters. A `boundary=` inside a quoted value is not a
-parameter. If the header has more than one `boundary` parameter, the request is ambiguous. The Worker answers it with
-`400 Bad Request` (plain text) and does not call your origin. A delimiter line is `--boundary` followed only by spaces
-or tabs and a line break; `--boundary-X` is not a delimiter.
 
 A multipart email part with a `Content-Transfer-Encoding` other than `7bit`, `8bit` or `binary` (for example
 `quoted-printable` or `base64`) cannot be validated. When `VALID_STATUS` is set, the Worker rewrites its value to
 `INVALID`.
 
-The JSON branch is narrow. It applies to a JSON body whose top-level `form` member is a string holding a JSON object,
-the shape some form plugins post. Only the keys `email` and `your-email` of that inner object are used, exactly as
-spelled. A key such as `email2` is not used. When `VALID_STATUS` is set, an email key whose value is not a string is set
-to `"INVALID"`. A plain `{"email": ...}` body has no `form` member, so it is forwarded untouched and not validated.
+If the `Content-Type` header contains the word `boundary` more than once, in any form (inside quotes, as `xboundary`,
+as `boundary*`), the request is ambiguous. The boundary value itself does not count, so a browser boundary such as
+`----WebKitFormBoundaryAbc123` is fine. The Worker answers it with `400 Bad Request` (plain text) and does not call
+your origin. A delimiter line is `--boundary` followed only by spaces or tabs and a line break; `--boundary-X` is not a
+delimiter.
 
-When a field is repeated, or several email names are present (for example `email` and `your-email`), only the chosen
-address is validated. When `VALID_STATUS` is set, every value of those fields that differs from the validated address is
-replaced by `INVALID`, whatever the status. When the status is outside `VALID_STATUS`, every value of those fields is
-replaced, including the validated one. In the fallback case (no email field, or an `email` field that holds something
-that is not an address) the same rule applies to repeats of the chosen field's name. If the validation gives no status
-(fail open), or `VALID_STATUS` is not set, the body is not touched.
+**JSON branch.** It applies to a JSON body whose top-level `form` member is a string holding a JSON object, the shape
+some form plugins post. Every key of that inner object that contains `email` is an email field, as above. A key such
+as `email_password` whose value is not an address is never sent anywhere. When `VALID_STATUS` is set, an email key whose
+value is not a string is set to `"INVALID"`. A rewritten body is serialised again. A plain `{"email": ...}` body has no
+`form` member, so it is forwarded untouched and not validated. (Earlier versions read any key that starts with `email`.
+This version reads any key that contains it.)
 
 For URL-encoded and multipart bodies, every other byte reaches your origin exactly as it was sent, including its
 percent-encoding and any uploaded files. A rewritten JSON body is different: the Worker serialises it again, so

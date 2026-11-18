@@ -80,7 +80,8 @@ function errorLine(message) {
  *
  * The name is read from the raw bytes: a leading "?" is part of the name
  * ("?email" is not "email"), which URLSearchParams would otherwise strip from
- * the start of a string.
+ * the start of a string. A field is an email field (`email: true`) when its
+ * name contains "email", decoded or as sent (see isEmailFieldName).
  */
 function formFields(bytes) {
     const fields = [];
@@ -98,7 +99,15 @@ function formFields(bytes) {
             // The leading "&" keeps URLSearchParams from dropping a "?" in the name.
             const [[name, value]] = new URLSearchParams(`&${bufferToText(raw)}`);
 
-            fields.push({ name, value, valueStart: equals === -1 ? end : start + equals + 1, end });
+            const rawName = bufferToText(equals === -1 ? raw : raw.subarray(0, equals));
+
+            fields.push({
+                name,
+                value,
+                valueStart: equals === -1 ? end : start + equals + 1,
+                end,
+                email: isEmailFieldName(name) || isEmailFieldName(rawName),
+            });
         }
 
         start = end + 1;
@@ -144,16 +153,23 @@ function mediaType(contentType) {
 /**
  * The boundary of a multipart Content-Type header: {boundary, ambiguous}. The
  * parameters are parsed as a header does (a token or a quoted string with
- * backslash escapes), so a "boundary=" inside a quoted value is not a
- * parameter. More than one boundary parameter is ambiguous: parsers disagree
- * on which one wins, so the Worker refuses the request (400) rather than read
- * the body one way while the origin reads it another.
+ * backslash escapes). The word "boundary" more than once anywhere in the
+ * header (as a second parameter, inside a quoted value, as "xboundary" or
+ * "boundary*") is ambiguous: parsers disagree on which one wins, so the Worker
+ * refuses the request (400) rather than read the body one way while the origin
+ * reads it another. The one exception is the chosen boundary's own value:
+ * browsers send boundaries such as "----WebKitFormBoundary0123", which hold
+ * the word themselves. (A value with a backslash is not set aside.)
  */
 function multipartBoundary(contentType) {
-    const found = headerParameterList(String(contentType)).filter(([name]) => name === 'boundary');
+    const text = String(contentType);
+    const count = (t) => (t.match(/boundary/gi) || []).length;
+    const found = headerParameterList(text).filter(([name]) => name === 'boundary');
+    const boundary = found.length === 1 && found[0][1] !== '' ? found[0][1] : null;
+    const own = boundary !== null && !boundary.includes('\\') ? count(boundary) : 0;
     return {
-        boundary: found.length === 1 && found[0][1] !== '' ? found[0][1] : null,
-        ambiguous: found.length > 1,
+        boundary,
+        ambiguous: count(text) - own > 1,
     };
 }
 
@@ -241,16 +257,18 @@ const IDENTITY_ENCODINGS = ['7bit', '8bit', 'binary'];
  * or tabs and a line break, or by "--" (the closing delimiter, after which
  * everything is epilogue and never read).
  *
- * A part with a filename (or a filename*) is a file and is skipped, its bytes
- * never read as an address and never rewritten, unless its name is one an
- * origin reads as an email field (see isEmailFieldName): PHP lists a part named
- * `email` with a bare `filename` among its text fields. When a part repeats
- * Content-Disposition, it is a candidate if any of them names one; the first
- * supplies the name and filename otherwise. A candidate part with a transfer
- * encoding other than 7bit, 8bit or binary (quoted-printable, base64) is
- * `opaque`: its value is not what an origin that decodes it would read, so it
- * cannot be validated. No regular expression runs over body bytes here, so the
- * cost is linear.
+ * A part is an email field (`email: true`) when its raw header block (every
+ * header line up to the blank line, folded lines included) contains "email",
+ * whatever the syntax of its Content-Disposition: the Worker does not try to
+ * read names the way each origin does. A part with a filename (or a filename*)
+ * is a file and is skipped, its bytes never read as an address and never
+ * rewritten, unless it is an email field. The name is the parsed
+ * Content-Disposition `name` (one that is exactly email, your-email or
+ * your_email is preferred when a part repeats the header), or '' when none
+ * parses. An email part with a transfer encoding other than 7bit, 8bit or
+ * binary (quoted-printable, base64) is `opaque`: its value is not what an
+ * origin that decodes it would read, so it cannot be validated. No regular
+ * expression runs over body bytes here, so the cost is linear.
  */
 function multipartFields(bytes, boundary) {
     const LF = 0x0a;
@@ -302,8 +320,7 @@ function multipartFields(bytes, boundary) {
         // Headers, up to the first blank line.
         let position = start;
         let bodyStart = -1;
-        const dispositions = [];
-        let encoded = false;
+        let headerEnd = start;
         while (position < end) {
             const lf = bytes.indexOf(LF, position);
             if (lf === -1 || lf >= end) {
@@ -312,9 +329,24 @@ function multipartFields(bytes, boundary) {
             const lineStop = lf > position && bytes[lf - 1] === CR ? lf - 1 : lf;
             if (lineStop === position) {
                 bodyStart = lf + 1;
+                headerEnd = position;
                 break;
             }
-            const line = bufferToText(bytes.subarray(position, lineStop));
+            position = lf + 1;
+        }
+        if (bodyStart === -1) {
+            continue;
+        }
+
+        // The raw header block decides whether this is an email field, whatever
+        // the syntax of its Content-Disposition (an origin may read a name
+        // that this parser does not). Folded lines are joined for parsing.
+        const headerText = bufferToText(bytes.subarray(start, headerEnd));
+        // A backslash escape inside a quoted name ("em\\ail") reads as the plain letters.
+        const email = isEmailFieldName(headerText) || isEmailFieldName(headerText.replace(/\\/g, ''));
+        const dispositions = [];
+        let encoded = false;
+        for (const line of headerText.replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/)) {
             const colon = line.indexOf(':');
             if (colon !== -1) {
                 const header = line.slice(0, colon).trim().toLowerCase();
@@ -324,29 +356,30 @@ function multipartFields(bytes, boundary) {
                     encoded = true;
                 }
             }
-            position = lf + 1;
         }
-        if (bodyStart === -1 || dispositions.length === 0) {
+        if (dispositions.length === 0) {
             continue;
         }
 
         const parsed = dispositions.map(headerParameters);
-        const candidate = parsed.find((params) => Object.prototype.hasOwnProperty.call(params, 'name') && isEmailFieldName(params.name));
+        const has = (params, key) => Object.prototype.hasOwnProperty.call(params, key);
         const first = parsed[0];
-        if (!candidate && (Object.prototype.hasOwnProperty.call(first, 'filename') || Object.prototype.hasOwnProperty.call(first, 'filename*'))) {
+        if (!email && (has(first, 'filename') || has(first, 'filename*'))) {
             continue;
         }
+        const named = parsed.find((params) => has(params, 'name') && EXACT_EMAIL_NAMES.includes(params.name)) || parsed.find((params) => has(params, 'name'));
 
         let valueStart = bodyStart;
         let valueEnd = Math.max(bodyStart, end);
         while (valueStart < valueEnd && isAsciiSpace(bytes[valueStart])) valueStart++;
         while (valueEnd > valueStart && isAsciiSpace(bytes[valueEnd - 1])) valueEnd--;
         fields.push({
-            name: candidate ? candidate.name : (Object.prototype.hasOwnProperty.call(first, 'name') ? first.name : ''),
+            name: named ? named.name : '',
             value: bufferToText(bytes.subarray(valueStart, valueEnd)),
             valueStart,
             end: valueEnd,
-            opaque: Boolean(candidate) && encoded,
+            email,
+            opaque: email && encoded,
         });
     }
 
@@ -354,29 +387,19 @@ function multipartFields(bytes, boundary) {
 }
 
 /**
- * The field names the Worker reads, in order of preference. A name counts the
- * way an origin such as PHP reads it (see phpFieldName), so "your.email" and
- * " email" are candidates and "?email" is not.
+ * The names that mark the field a form uses for its address, whatever the
+ * other email fields hold. The match is exact (after decoding).
  */
-const EMAIL_FIELD_NAMES = ['email', 'your-email', 'your_email'];
+const EXACT_EMAIL_NAMES = ['email', 'your-email', 'your_email'];
 
 /**
- * A field name as PHP names the variable: cut at the first NUL, leading
- * whitespace dropped, then every space and "." read as "_". The name is already
- * percent-decoded (url-encoded body) or as written (multipart).
+ * Whether a field name is an email field: it contains "email", in any case.
+ * This does not depend on how an origin (PHP, say) parses a name, which keeps
+ * changing: whatever the origin reads as an address field, its name or its
+ * raw header carries those five letters.
  */
-function phpFieldName(name) {
-    let text = String(name);
-    const nul = text.indexOf('\0');
-    if (nul !== -1) {
-        text = text.slice(0, nul);
-    }
-    return text.replace(/^\s+/, '').replace(/[ .]/g, '_');
-}
-
-/** Whether an origin reads a field of this name as email, your-email or your_email. */
 function isEmailFieldName(name) {
-    return EMAIL_FIELD_NAMES.includes(phpFieldName(name));
+    return /email/i.test(String(name));
 }
 
 /** An address longer than this cannot be one (RFC 5321 allows 254). */
@@ -389,45 +412,56 @@ function isAddress(value) {
 }
 
 /**
- * Picks the address to validate among the fields of a form: the first field
- * named `email` whose value is an address, then the same for `your-email` and
- * `your_email` (names as an origin reads them, see phpFieldName); when no such
- * field holds one, the first field whose whole value is an address. A field
- * that cannot be read (`opaque`) is never chosen. Returns {field, named} or null.
+ * Picks the address to validate among the fields of a form: the first email
+ * field named exactly `email`, `your-email` or `your_email` whose value is an
+ * address; else the first email field whose value is an address; else (the
+ * fallback, `fallback: true`) the first field of any name whose whole value is
+ * an address. A field that cannot be read (`opaque`) is never chosen, and
+ * nothing but an address is ever returned. Returns {field, fallback} or null.
  */
 function chooseAddressField(fields) {
     const readable = fields.filter((f) => !f.opaque);
-    for (const name of EMAIL_FIELD_NAMES) {
-        const field = readable.find((f) => phpFieldName(f.name) === name && isAddress(f.value));
-        if (field) {
-            return { field, named: true };
-        }
+    const exact = readable.find((f) => f.email && EXACT_EMAIL_NAMES.includes(f.name) && isAddress(f.value));
+    if (exact) {
+        return { field: exact, fallback: false };
+    }
+    const any = readable.find((f) => f.email && isAddress(f.value));
+    if (any) {
+        return { field: any, fallback: false };
     }
     const field = readable.find((f) => isAddress(f.value));
-    return field ? { field, named: false } : null;
+    return field ? { field, fallback: true } : null;
+}
+
+/** Whether two addresses are the same, ignoring surrounding space and ASCII case. */
+function sameAddress(a, b) {
+    return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
 }
 
 /**
  * The fields to rewrite once the chosen address is validated (`chosen` is null
- * when there is none). Only one address costs a validation credit, so any other
- * value of a candidate field (every repeat, and the other of `email` /
- * `your-email`, however the origin would spell the name) would reach the origin
- * unvalidated: it is rewritten too when it differs from the validated address,
- * whatever the status. A rejected address rewrites every candidate value. The
- * candidates are the named fields, or, when the address was found in a field
- * with another name, every field that reads as that name. Empty values stay.
- * An `opaque` field (a value that cannot be read) is always rewritten.
+ * when there is none). Only one address costs a validation credit, so every
+ * other address an origin might read from an email field would reach it
+ * unvalidated. A rejected address rewrites the chosen field and every email
+ * field that holds an address; an accepted one rewrites every email field
+ * that holds a different address. In the fallback, a repeat of the chosen
+ * field's name follows the same rule. Empty values and values that are not an
+ * address stay. An `opaque` field (a value that cannot be read) is always
+ * rewritten.
  */
 function fieldsToRewrite(fields, chosen, rejected) {
-    const address = chosen ? chosen.field.value.trim() : '';
+    const address = chosen ? chosen.field.value : '';
     return fields.filter((f) => {
         if (f.opaque) {
             return f.forced || f.value.trim() !== '';
         }
-        return chosen !== null &&
-            (chosen.named ? isEmailFieldName(f.name) : phpFieldName(f.name) === phpFieldName(chosen.field.name)) &&
-            f.value.trim() !== '' &&
-            (rejected || f.value.trim() !== address);
+        if (chosen === null) {
+            return false;
+        }
+        const hit = f === chosen.field ||
+            (f.email && isAddress(f.value)) ||
+            (chosen.fallback && f.name === chosen.field.name && f.value.trim() !== '');
+        return hit && (rejected || !sameAddress(f.value, address));
     });
 }
 
@@ -487,7 +521,10 @@ function logValidation(event, email, url, result) {
 
         // The waitUntil function allows us to continue performing work in our Cloudflare Worker, without blocking.
         // Every string is redacted before it is stored, so the API key never reaches KV.
-        event.waitUntil(LOGS.put(key, value));
+        // A put that fails later (a rejected promise) is reported, not left unhandled.
+        event.waitUntil(Promise.resolve(LOGS.put(key, value)).catch((err) => {
+            errorLine(`Unable to write the validation log to KV: ${err && err.message ? err.message : String(err)}`);
+        }));
     } catch (err) {
         errorLine(`Unable to write the validation log to KV: ${err && err.message ? err.message : String(err)}`);
     }
@@ -1142,51 +1179,74 @@ async function validateEmail(email, ip_address) {
 }
 
 /**
- * The entries of a text list binding, whatever way it was typed. In this order:
- * a JSON array of strings (`["valid", "catch-all"]`); else, if the text holds
- * quotes, every single- or double-quoted token (the form zerobounce.net's
- * guide shows: `['valid', 'catch-all', 'unknown']`, `'/login,' '/logout,'`);
- * else the text split on commas and white space (`valid,catch-all`, or one
- * entry). Always: each entry trimmed, trailing commas stripped, empties dropped.
+ * Quotes and brackets that are never part of a status or a path: ASCII
+ * `[ ] ' " backtick`, every character of the Unicode categories Pi and Pf
+ * (initial and final quotes), U+2018 to U+201F (the curly quotes zerobounce.net's
+ * guide prints: `[‘valid’, ‘catch-all’]`), the acute accent U+00B4, primes
+ * U+2032 to U+2037 and the guillemets U+00AB and U+00BB.
  */
-function listEntries(text) {
-    if (text.startsWith('[')) {
-        try {
-            const parsed = JSON.parse(text);
-            if (Array.isArray(parsed)) {
-                return parsed;
+const LIST_JUNK = /[\[\]'"`\p{Pi}\p{Pf}‘-‟´′-‷«»]/gu;
+
+/**
+ * The entries of a list binding, whatever way it was typed. A typed array, or
+ * a text that is a JSON array of strings, gives its items, each cleaned of
+ * quotes and brackets (LIST_JUNK) and of separators at its ends. Any other text (a plain value,
+ * `valid, catch-all`, `valid;catch-all`, `valid|catch-all`, `[valid, catch-all]`,
+ * or a list in the curly quotes the guide prints) has the same characters
+ * removed and is split on commas, semicolons, pipes and white space. Empty
+ * entries are dropped. Returns null when the value is neither text nor an
+ * array of strings.
+ */
+function listEntries(value) {
+    let items = value;
+    if (typeof value === 'string') {
+        items = null;
+        const text = value.trim();
+        if (text.startsWith('[')) {
+            try {
+                const parsed = JSON.parse(text);
+                if (Array.isArray(parsed) && parsed.every((item) => typeof item === 'string')) {
+                    items = parsed;
+                }
+            } catch (err) {
+                // Not JSON: read it as text.
             }
-        } catch (err) {
-            // Not JSON: read it as a quoted or comma-separated list.
+        }
+        if (items === null) {
+            return text.replace(LIST_JUNK, '').split(/[,;|\s]+/).map((item) => item.trim()).filter((item) => item !== '');
         }
     }
-    if (/['"]/.test(text)) {
-        return [...text.matchAll(/'([^']*)'|"([^"]*)"/g)].map((match) => (match[1] !== undefined ? match[1] : match[2]));
+    if (!Array.isArray(items) || items.some((item) => typeof item !== 'string')) {
+        return null;
     }
-    return text.split(/[,\s]+/);
+    return items.map((item) => item.replace(LIST_JUNK, '').replace(/^[,;|\s]+|[,;|\s]+$/g, '')).filter((item) => item !== '');
 }
 
 /**
  * A binding that holds a list (VALID_STATUS, BYPASS_PATH) as an array of
- * non-empty strings. A typed array is used as it is; a text is read by
- * listEntries. With `lower`, every entry is lower-cased (statuses are compared
- * case-insensitively; paths match exactly). Returns null when the binding is
- * not set, or holds no usable entry, in which case the problem is logged (once
- * per request).
+ * non-empty strings (see listEntries). With `lower`, the binding is a list of
+ * statuses: every entry is lower-cased, an entry that is not one of the API's
+ * statuses is logged ("Ignoring unknown status") and dropped, since it can
+ * never match. Paths match exactly. Returns null when the binding is not set
+ * or holds no usable entry; the problem is logged (once per request).
  */
 function bindingList(name, value, lower = false) {
     if (value === undefined || value === null) {
         return null;
     }
-    const entries = typeof value === 'string' ? listEntries(value.trim()) : value;
-    if (!Array.isArray(entries) || entries.some((item) => typeof item !== 'string')) {
+    let list = listEntries(value);
+    if (list === null) {
         logLine(`Ignoring ${name}: it must be a list of strings (a JSON array is preferred).`);
         return null;
     }
-    const list = entries
-        .map((item) => item.trim().replace(/,+$/, '').trim())
-        .filter((item) => item !== '')
-        .map((item) => (lower ? item.toLowerCase() : item));
+    if (lower) {
+        list = list.map((item) => item.toLowerCase());
+        const unknown = list.filter((item) => !API_STATUSES.includes(item));
+        for (const item of unknown) {
+            logLine(`Ignoring unknown status ${JSON.stringify(item)} in ${name}. The statuses are ${API_STATUSES.join(', ')}.`);
+        }
+        list = list.filter((item) => API_STATUSES.includes(item));
+    }
     if (list.length === 0) {
         logLine(`Ignoring ${name}: it holds no entry.`);
         return null;
@@ -1258,7 +1318,8 @@ async function handleRequest(event) {
         }
 
         if (contentType) {
-            logLine(`Incoming content type: ${contentType}`);
+            // Only the media type is logged: the parameters are attacker-sized.
+            logLine(`Incoming content type: ${mediaType(contentType).slice(0, 100)}`);
 
             if (mediaType(contentType) === 'multipart/form-data') {
                 // The body is read part by part and never decoded or
@@ -1310,7 +1371,7 @@ async function handleRequest(event) {
                 const fields = formFields(_body);
 
                 // Method 1:
-                // The field named email (then your-email) whose value is an address.
+                // The first field named exactly email, your-email or your_email whose value is an address.
                 // Method 2:
                 // Otherwise the first field whose value is an email address. This
                 // applies when the email input is not named accordingly (email).
@@ -1319,7 +1380,7 @@ async function handleRequest(event) {
 
                 if (chosen !== null) {
                     const email = chosen.field.value.trim();
-                    logLine(chosen.named ? `Found email input: ${email}` : `Matched email: ${email}`);
+                    logLine(chosen.fallback ? `Matched email: ${email}` : `Found email input: ${email}`);
 
                     const outcome = await validateAddress(event, email, pathname, clientIP, validStatus);
 
@@ -1358,19 +1419,18 @@ async function handleRequest(event) {
                 }
 
                 if (_form && typeof _form === 'object' && !Array.isArray(_form)) {
-                    // Only the keys "email" and "your-email", exactly: another
-                    // field (email_password, emailConfirm) is not an address.
-                    // A value that is not a string cannot be validated; it is
-                    // opaque, and is set to "INVALID" when VALID_STATUS is set.
-                    const fields = ['email', 'your-email']
-                        .filter((name) => Object.prototype.hasOwnProperty.call(_form, name))
+                    // Every key that contains "email". A value that is not a
+                    // string cannot be validated; it is opaque, and is set to
+                    // "INVALID" when VALID_STATUS is set.
+                    const fields = Object.keys(_form)
+                        .filter(isEmailFieldName)
                         .map((name) => (typeof _form[name] === 'string'
-                            ? { name, value: _form[name] }
-                            : { name, value: '', opaque: true, forced: true }));
+                            ? { name, value: _form[name], email: true }
+                            : { name, value: '', email: true, opaque: true, forced: true }));
                     const chosen = chooseAddressField(fields);
                     let targets = [];
 
-                    if (chosen !== null && chosen.named) {
+                    if (chosen !== null) {
                         const email = chosen.field.value.trim();
                         logLine(`Matched email: ${email}`);
 

@@ -42,8 +42,8 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 | `API_KEY` | ZeroBounce API key, an encrypted secret. Without it no validation happens. |
 | `API_REGION` | `us` or `usa`, `eu`, or unset / `global` / `default` for the global host. |
 | `API_TIMEOUT` | Milliseconds, passed to `AbortSignal.timeout`. Defaults to 10000 when unset, empty, not a whole number, or outside 1 to 600000. |
-| `VALID_STATUS` | Allow-list of ZeroBounce statuses (JSON array; a plain string is one entry). A status outside it is rewritten to `INVALID`. |
-| `BYPASS_PATH` | Paths that are forwarded untouched (JSON array; a plain string is one entry). Exact match only. |
+| `VALID_STATUS` | Allow-list of ZeroBounce statuses (JSON array preferred; the guide's quoted forms work, see Conventions). A status outside it is rewritten to `INVALID`. |
+| `BYPASS_PATH` | Paths that are forwarded untouched (JSON array preferred; a plain string is one entry). Exact match only. |
 | `LOGS` | KV namespace. When bound, each validation result is written to it. |
 
 ## Conventions
@@ -59,14 +59,25 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 - **The address regex is deliberate.** It is built from a string (so every backslash is doubled) and it is only ever
   applied anchored, to one trimmed value at a time. Never run an address regex unanchored over attacker text: that was a
   ReDoS and a mis-extraction bug.
-- **Field names follow PHP.** `formFields` and `multipartFields` normalise names the way PHP does, so `your.email` and
-  `%20email` count and `?email` does not. An ambiguous multipart `boundary` is answered with `400 Bad Request`.
+- **Email fields are found by a rule that does not depend on the origin.** Do not copy the way PHP (or any origin)
+  parses field names: that was tried three times and each time a new parsing rule leaked an address. An email field is
+  any field whose name contains `email` (ASCII case-insensitive). URL-encoded: the name as sent and after
+  percent-decoding. Multipart: the raw header block of the part, folded lines included. JSON (`form` member): the key.
+  One address is validated: first an email field named exactly `email`, `your-email` or `your_email`, then any email
+  field, then (fallback) any field whose value is an address. Never send a value that is not an address. With
+  `VALID_STATUS` set, every other email field that holds an address different from the validated one is rewritten to
+  `INVALID`, and a rejected status rewrites all of them. File parts are read only if their headers mention `email`.
+  A `Content-Type` that contains `boundary` more than once is answered with `400 Bad Request`.
+- **Binding lists are forgiving.** `VALID_STATUS` and `BYPASS_PATH` are read as a JSON array of strings first. Otherwise
+  the text loses every bracket and quote mark (straight and curly, because the live guide uses curly quotes) and is
+  split on commas, semicolons, pipes and whitespace. Statuses that are not one of the seven API statuses are logged
+  once per request and ignored; with none left the binding counts as not set. Paths match exactly.
 - **URL-encoded bodies are rewritten by byte span, never decoded and re-encoded as a whole.** `formFields` splits
   the raw body on `&` and decodes each field with `URLSearchParams` (which never throws on bad percent-encoding);
   `replaceFieldValues` swaps only the rejected value. Every other byte must reach the origin as sent.
 - **Multipart bodies are never decoded as a whole either.** `multipartFields` splits the raw body on its boundary
   and reads the headers and value of each part as a one-character-per-byte string, so offsets are byte offsets. File
-  parts are skipped unless they are named like an email field. `chooseAddressField` picks the address and
+  parts are skipped unless their headers mention `email`. `chooseAddressField` picks the address and
   `fieldsToRewrite` lists the fields to change; `replaceFieldValues` then swaps only those values. A UTF-8 decode and re-encode of
   the body would replace every non-UTF-8 byte of an uploaded file with U+FFFD.
 - **Content types are compared by media type** (`mediaType`: lower case, parameters dropped), never with `===` on the
@@ -74,7 +85,8 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 - **The Content-Type of a rewritten request is inherited from the incoming request.** When you change a body, keep its
   encoding: handing a `FormData` object to a request that still carries
   `Content-Type: application/x-www-form-urlencoded` produces a multipart body the origin cannot parse.
-- **Keep the pass-through guarantee.** Every branch ends in `return await fetch(request)`, and
+- **Keep the pass-through guarantee.** Every branch ends in `return await fetch(request)`, except the
+  `400 Bad Request` answer for an ambiguous multipart `boundary`, which returns a `Response` and never reaches the origin.
   `event.passThroughOnException()` means a thrown error silently forwards to the origin. A change that can hang or
   throw before that point breaks the customer's form instead of their bad addresses.
 - **Fail open, but never silently.** A validation that yields no status (dead key, timeout, redirect, network error)

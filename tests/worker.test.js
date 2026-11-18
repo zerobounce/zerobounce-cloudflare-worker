@@ -1383,16 +1383,20 @@ test('H1: only the value bytes are replaced; the whitespace around them stays', 
     assert.strictEqual(text, mpBody(field('email', '  \tINVALID \n ')));
 });
 
-test('H1: a filename (or filename*) marks a file; a filename that quotes name="email" does not rename the part', async () => {
-    const file = 'Content-Disposition: form-data; name="doc"; filename="name=\\"email\\"; x.txt"\r\n\r\nsomeone@x.com';
+test('H1: a filename (or filename*) marks a file, unless the part header mentions email', async () => {
+    const file = 'Content-Disposition: form-data; name="doc"; filename="x.txt"\r\n\r\nsomeone@x.com';
     const star = 'Content-Disposition: form-data; name="doc2"; filename*=UTF-8\'\'a.txt\r\n\r\nsomeone@x.com';
     const { calls } = await runHandler(mpRequest(mpBody(file, star)));
 
     assert.strictEqual(calls.validation.length, 0);
 
-    // The quoted filename is not the field name: the part is named "x" and is a file.
+    // A filename that quotes name="email" is a header that mentions email: the
+    // part is read (an origin may take it for the field), and rewritten when it holds an address.
     const text = mpBody('Content-Disposition: form-data; name="x"; filename="a; name=email"\r\n\r\nsomeone@x.com');
-    assert.strictEqual((await runHandler(mpRequest(text))).calls.validation.length, 0);
+    const read = await runHandler(mpRequest(text), { status: 'valid' });
+    assert.deepStrictEqual(validated(read.calls), ['someone@x.com']);
+    const rejected = await runHandler(mpRequest(text));
+    assert.strictEqual(rejected.text, mpBody('Content-Disposition: form-data; name="x"; filename="a; name=email"\r\n\r\nINVALID'));
 });
 
 test('H1: a text part whose name hides in a quoted parameter value is read by its real name', async () => {
@@ -1408,10 +1412,13 @@ test('M1: repeated and alias fields cost one validation; every other candidate v
     const cases = [
         ['email=a%40x.com&email=b%40x.com', 'email=a%40x.com&email=INVALID'],
         ['email=a%40x.com&your-email=b%40x.com', 'email=a%40x.com&your-email=INVALID'],
-        ['your-email=b%40x.com&email=a%40x.com&email=a%40x.com', 'your-email=INVALID&email=a%40x.com&email=a%40x.com'],
-        ['email=junk&email=a%40x.com', 'email=INVALID&email=a%40x.com'],
+        // The first email field named exactly email, your-email or your_email wins, by position.
+        ['your-email=b%40x.com&email=a%40x.com&email=a%40x.com', 'your-email=b%40x.com&email=INVALID&email=INVALID'],
+        // A value that is not an address is left alone.
+        ['email=junk&email=a%40x.com', 'email=junk&email=a%40x.com'],
         ['email=a%40x.com&email=&n=1', 'email=a%40x.com&email=&n=1'],
-        ['contact=a%40x.com&contact=b%40x.com&email2=c%40x.com', 'contact=a%40x.com&contact=INVALID&email2=c%40x.com'],
+        ['contact=a%40x.com&contact=b%40x.com', 'contact=a%40x.com&contact=INVALID'],
+        ['contact=a%40x.com&contact=b%40x.com&email2=c%40x.com', 'contact=a%40x.com&contact=b%40x.com&email2=c%40x.com'],
     ];
     for (const [sent, expected] of cases) {
         const { calls, text } = await runHandler(formRequest(sent), { status: 'valid' });
@@ -1440,13 +1447,14 @@ test('M1: a fail-open validation leaves repeated fields untouched, and so does a
 test('M1: a leading ? is part of the field name; ?email is not email', async () => {
     const { calls, text } = await runHandler(formRequest('%3Femail=zz%40x.com&?email=a%40x.com&email=b%40x.com'), { status: 'valid' });
 
-    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'b%40x.com'.replace('%40', '@'));
-    assert.strictEqual(text, '%3Femail=zz%40x.com&?email=a%40x.com&email=b%40x.com');
+    // The exact name wins; the other fields contain "email" and hold other addresses.
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'b@x.com');
+    assert.strictEqual(text, '%3Femail=INVALID&?email=INVALID&email=b%40x.com');
 
     const only = await runHandler(formRequest('?email=a%40x.com'), { status: 'valid' });
-    // Found as the first field holding an address, not as "email".
+    // Found as the first email field holding an address (its name is not exactly "email").
     assert.strictEqual(only.calls.validation.length, 1);
-    assert.ok(only.logs.some((line) => line.startsWith('Matched email')));
+    assert.ok(only.logs.some((line) => line.startsWith('Found email input')));
 });
 
 test('M1: repeated multipart fields follow the same rule', async () => {
@@ -1627,16 +1635,21 @@ test('Low: an error whose name quotes the key is redacted in the log and in the 
     for (const line of errors) assert.ok(!line.includes(API_KEY), line);
 });
 
-test('Low: only the exact JSON keys email and your-email are read', async () => {
+test('Low: every JSON key that contains email is an email field; its value is read only when it is an address', async () => {
     const make = (form) => new Request('https://example.com/f', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ form: JSON.stringify(form) }),
     });
-    for (const form of [{ email_password: 'hunter2secret' }, { emailConfirm: 'a@x.com' }, { Email: 'a@x.com' }]) {
+    for (const form of [{ email_password: 'hunter2secret' }, { note: 'a@x.com' }]) {
         const worker = await runHandler(make(form));
         assert.strictEqual(worker.calls.validation.length, 0, JSON.stringify(form));
         for (const line of worker.logs) assert.ok(!line.includes('hunter2secret'), line);
+    }
+    for (const key of ['emailConfirm', 'Email', 'EMAIL_2']) {
+        const worker = await runHandler(make({ [key]: 'a@x.com' }));
+        assert.deepStrictEqual(validated(worker.calls), ['a@x.com'], key);
+        assert.deepStrictEqual(JSON.parse(JSON.parse(worker.text).form), { [key]: 'INVALID' }, key);
     }
     const ok = await runHandler(make({ email_password: 'x', 'your-email': 'a@x.com' }));
     assert.strictEqual(ok.calls.validation.length, 1);
@@ -1671,7 +1684,7 @@ test('Low: VALID_STATUS and BYPASS_PATH bound as text: a JSON array, or one plai
         ['valid', 'valid', false],
         ['valid', 'invalid', true],
         ['  ["valid"]  ', 'invalid', true],
-        ['[valid', 'valid', true], // not JSON: one entry "[valid"
+        ['[valid', 'valid', false], // not JSON: the bracket is dropped, the entry is "valid"
     ]) {
         const { text } = await runHandler(formRequest(sent), { bindings: { VALID_STATUS }, status });
         assert.strictEqual(text, rewritten ? 'email=INVALID' : sent, `${VALID_STATUS} ${status}`);
@@ -1935,16 +1948,16 @@ test('R2: a typed array with a non-string item, or another type, is logged and i
 
 // --- field names the way PHP reads them -----------------------------------
 
-test('R2 bypass: url-encoded names are matched the way PHP reads them', async () => {
+test('R2 bypass: every url-encoded field whose name contains email is an email field, whatever the origin makes of the name', async () => {
     const good = 'email=g%40ok.example';
     const evil = 'e%40bad.example';
-    for (const name of ['%20email', '+email', '%09email', 'email%00x', 'email%00', 'your.email', 'your+email', 'your_email', '%20your-email', 'email', '%20%20email']) {
+    for (const name of ['%20email', '+email', '%09email', 'email%00x', 'email%00', 'your.email', 'your+email', 'your_email', '%20your-email', 'email', '%20%20email', '%3Femail', '?email', 'email%20', 'xemail', 'email.x', 'EMAIL', 'Your[Email', 'email[]', 'em%61il', 'e.email']) {
         const { calls, text } = await runHandler(formRequest(`${good}&${name}=${evil}`), { status: 'valid' });
         assert.deepStrictEqual(validated(calls), ['g@ok.example'], name);
         assert.strictEqual(text, `${good}&${name}=INVALID`, name);
     }
-    // PHP keeps these as other names.
-    for (const name of ['%3Femail', '?email', 'email%20', 'xemail', 'email.x', 'e.mail']) {
+    // No "email" in the name, decoded or raw: not an email field, and not read when a named field exists.
+    for (const name of ['e.mail', 'e%2Dmail', 'mail', 'em%2Bail']) {
         const { calls, text } = await runHandler(formRequest(`${good}&${name}=${evil}`), { status: 'valid' });
         assert.strictEqual(calls.validation.length, 1, name);
         assert.strictEqual(text, `${good}&${name}=${evil}`, name);
@@ -1957,10 +1970,13 @@ test('R2 bypass: an alias alone is the field that is validated', async () => {
     assert.strictEqual(text, 'your.email=INVALID&n=1');
 });
 
-test('R2 bypass: fallback mode reads names the same way (an alias of the found field is a repeat)', async () => {
-    const { calls, text } = await runHandler(formRequest('contact=a%40x.com&%20contact=b%40x.com&c.ontact=c%40x.com'), { status: 'valid' });
+test('R2 bypass: in fallback mode a repeat of the found field is rewritten, and so is an email field holding another address', async () => {
+    const { calls, text } = await runHandler(formRequest('contact=a%40x.com&contact=b%40x.com&c.ontact=c%40x.com'), { status: 'valid' });
     assert.deepStrictEqual(validated(calls), ['a@x.com']);
-    assert.strictEqual(text, 'contact=a%40x.com&%20contact=INVALID&c.ontact=c%40x.com');
+    assert.strictEqual(text, 'contact=a%40x.com&contact=INVALID&c.ontact=c%40x.com');
+    // An email field is found before the fallback, so it is the one validated.
+    const named = await runHandler(formRequest('contact=a%40x.com&notemail=c%40x.com'), { status: 'valid' });
+    assert.deepStrictEqual(validated(named.calls), ['c@x.com']);
 });
 
 test('R2 bypass: multipart names are matched the way PHP reads them', async () => {
@@ -2005,11 +2021,11 @@ test('R2 bypass: a part with two Content-Disposition headers is a candidate if a
     assert.deepStrictEqual(validated((await runHandler(mpRequest(text), { status: 'valid' })).calls), ['a@x.com']);
 });
 
-test('R2: the first name parameter of a disposition wins for the part that is not a candidate', async () => {
+test('R2: a part whose header mentions email is an email field even when its first name parameter is another', async () => {
     const body = mpBody(field('email', 'q@x.com'), 'Content-Disposition: form-data; name="x"; name="email"\r\n\r\np@x.com');
     const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
     assert.deepStrictEqual(validated(calls), ['q@x.com']);
-    assert.strictEqual(text, body);
+    assert.strictEqual(text, mpBody(field('email', 'q@x.com'), 'Content-Disposition: form-data; name="x"; name="email"\r\n\r\nINVALID'));
 });
 
 test('R2: parameter names are case-insensitive, unquoted values are trimmed, quoted ones unescape', async () => {
@@ -2029,8 +2045,6 @@ test('R2 bypass: the boundary parameter is parsed as a header parameter', async 
     const body = rawMp('zb-b', field('email', 'g@ok.example'), field('your-email', 'e@bad.example'));
     const fixed = rawMp('zb-b', field('email', 'g@ok.example'), field('your-email', 'INVALID'));
     for (const type of [
-        'multipart/form-data; x="; boundary=A"; boundary=zb-b',
-        'multipart/form-data; x="a\\"; boundary=A"; boundary=zb-b',
         'multipart/form-data; boundary="zb-b"',
         'multipart/form-data;boundary=zb-b',
         'multipart/form-data; BOUNDARY=zb-b; charset=utf-8',
@@ -2050,7 +2064,7 @@ test('R2 bypass: the boundary parameter is parsed as a header parameter', async 
 
 test('R2 bypass: more than one boundary parameter is answered 400 by the Worker, with no origin call', async () => {
     const body = rawMp('zb-b', field('email', 'g@ok.example'));
-    for (const type of ['multipart/form-data; boundary=zb-b; boundary=other', 'multipart/form-data; boundary=zb-b; BOUNDARY="zb-b"', 'multipart/form-data; boundary=a; x=y; boundary=']) {
+    for (const type of ['multipart/form-data; x="; boundary=A"; boundary=zb-b', 'multipart/form-data; x="a\\"; boundary=A"; boundary=zb-b', 'multipart/form-data; x="boundary=A"; boundary=zb-b', 'multipart/form-data; xboundary=A; boundary=zb-b', 'multipart/form-data; boundary*=utf-8\'\'A; boundary=zb-b', 'multipart/form-data; boundary=zb-b; BOUNDARY=zb-b', 'multipart/form-data; boundary=zb-b; boundary=other', 'multipart/form-data; boundary=zb-b; BOUNDARY="zb-b"', 'multipart/form-data; boundary=a; x=y; boundary=']) {
         const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
         const response = await worker.context.handleRequest(fetchEvent(multipartRequest(body, type)));
         assert.strictEqual(response.status, 400, type);
@@ -2159,9 +2173,9 @@ test('R2 bypass: a JSON candidate key whose value is not a string is set to INVA
         const unset = await runHandler(jsonRequest({ email: value }), { status: 'valid', bindings: { VALID_STATUS: undefined } });
         assert.deepStrictEqual(JSON.parse(JSON.parse(unset.text).form), { email: value });
     }
-    // Another key with a non-string value is not a candidate.
-    const other = await runHandler(jsonRequest({ email2: 5 }), { status: 'valid' });
-    assert.deepStrictEqual(JSON.parse(JSON.parse(other.text).form), { email2: 5 });
+    // Another key that contains email counts, one without it does not.
+    const other = await runHandler(jsonRequest({ email2: 5, note: 6 }), { status: 'valid' });
+    assert.deepStrictEqual(JSON.parse(JSON.parse(other.text).form), { email2: 'INVALID', note: 6 });
 });
 
 // --- small survivors --------------------------------------------------------
@@ -2362,4 +2376,273 @@ test('R2: a transfer-encoded candidate part is left alone when VALID_STATUS is n
 test('R2: a trailing comma and the space before it are dropped from a typed entry', async () => {
     const { text } = await runHandler(formRequest('email=a%40x.com'), { bindings: { VALID_STATUS: ['valid ,'] }, status: 'valid' });
     assert.strictEqual(text, 'email=a%40x.com');
+});
+
+// --- binding lists: the formats zerobounce.net's guide prints -----------------
+
+test('R3 HIGH: VALID_STATUS and BYPASS_PATH read the guide curly-quoted lists and other loose spellings', async () => {
+    const sent = 'email=a%40x.com';
+    const guide = '[‘valid’, ‘catch-all’, ‘unknown’]';
+    const accepted = [
+        guide,
+        "['valid', 'catch-all', 'unknown']",
+        '[valid, catch-all]',
+        'valid;catch-all',
+        'valid|catch-all',
+        "valid, 'catch-all'",
+        '"valid catch-all"',
+        '“valid” «catch-all»',
+        '`valid`,`catch-all`',
+        ['‘valid’', '‘catch-all’,'],
+        ' [ "valid" , "catch-all" ] ',
+    ];
+    for (const VALID_STATUS of accepted) {
+        for (const status of ['valid', 'catch-all']) {
+            const w = await runHandler(formRequest(sent), { bindings: { VALID_STATUS }, status });
+            assert.strictEqual(w.text, sent, `${JSON.stringify(VALID_STATUS)} ${status}`);
+            assert.ok(!w.logs.some((line) => line.startsWith('Ignoring')), JSON.stringify(VALID_STATUS));
+        }
+        const w = await runHandler(formRequest(sent), { bindings: { VALID_STATUS }, status: 'invalid' });
+        assert.strictEqual(w.text, 'email=INVALID', JSON.stringify(VALID_STATUS));
+    }
+    // The guide's unknown is in its list.
+    const w = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: guide }, status: 'unknown' });
+    assert.strictEqual(w.text, sent);
+
+    const guidePaths = '‘/login,’ ‘/logout,’ ‘/connect,’ ‘/signing’';
+    for (const [BYPASS_PATH, path, bypassed] of [
+        [guidePaths, '/login', true], [guidePaths, '/logout', true], [guidePaths, '/connect', true], [guidePaths, '/signing', true],
+        [guidePaths, '/Login', false], [guidePaths, '/login,', false],
+        ["'/login,' '/logout,' '/connect,' '/signing'", '/logout', true],
+        ['/a;/b|/c', '/c', true],
+        ['[/a, /b]', '/a', true],
+    ]) {
+        const { calls } = await runHandler(formRequest(sent, { url: `https://example.com${path}` }), { bindings: { BYPASS_PATH } });
+        assert.strictEqual(calls.validation.length, bypassed ? 0 : 1, `${JSON.stringify(BYPASS_PATH)} ${path}`);
+    }
+});
+
+test('R3 HIGH: an unknown status in VALID_STATUS is logged once and dropped; a list with none left counts as not set', async () => {
+    const sent = 'email=a%40x.com';
+    // catch_all (underscore) is not an API status.
+    const one = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: 'valid, catch_all' }, status: 'catch-all' });
+    assert.strictEqual(one.text, 'email=INVALID');
+    assert.strictEqual(one.logs.filter((line) => line.startsWith('Ignoring unknown status')).length, 1);
+    assert.ok(one.logs.some((line) => line.includes('catch_all')));
+
+    // Every entry unknown: the binding is not set, so nothing is rewritten, and it is logged.
+    const none = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: 'catch_all' }, status: 'invalid' });
+    assert.strictEqual(none.text, sent);
+    assert.strictEqual(none.logs.filter((line) => line.startsWith('Ignoring unknown status')).length, 1);
+    assert.strictEqual(none.logs.filter((line) => line.startsWith('Ignoring VALID_STATUS')).length, 1);
+
+    // The log line never carries the API key.
+    const keyed = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: `valid, ${API_KEY}` }, status: 'valid' });
+    for (const line of keyed.logs) assert.ok(!line.includes(API_KEY), line);
+
+    // Blank: not set, logged.
+    for (const blank of ['', '   ', '[]', "[ ]", '‘’']) {
+        const w = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: blank }, status: 'invalid' });
+        assert.strictEqual(w.text, sent, JSON.stringify(blank));
+        assert.strictEqual(w.logs.filter((line) => line.startsWith('Ignoring VALID_STATUS')).length, 1, JSON.stringify(blank));
+    }
+});
+
+// --- R3: the email-field rule (any field whose name or part header contains "email") ---
+
+/** Like fetchEvent, but keeps what is handed to waitUntil, so a test can await it. */
+function waitingEvent(request) {
+    const waits = [];
+    return { event: { request, waitUntil: (p) => waits.push(p), passThroughOnException: () => {} }, waits };
+}
+
+const GOOD = 'good@ok.example';
+const EVIL = 'evil@bad.example';
+const C = '\r\n';
+const mpPart = (header, value) => `${header}${C}${C}${value}${C}`;
+const mpGood = (b) => `--${b}${C}` + mpPart('Content-Disposition: form-data; name="email"', GOOD);
+const mpAll = (b, ...parts) => parts.join('') + `--${b}--${C}`;
+
+test('R3 e2e: no address other than the validated one stays in a field or part whose name or header contains email', async () => {
+    const B = 'B';
+    const cases = [
+        // [name, content-type, body, address that must be gone from the forwarded bytes]
+        ['disposition without form-data;', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: name="email"', EVIL))],
+        ['single-quoted name', mpAll(B, mpGood(B), `--${B}${C}` + mpPart("Content-Disposition: form-data; name='email'", EVIL))],
+        ['unquoted name and junk', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name=email junk', EVIL))],
+        ['junk after the closing quote', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="email"junk', EVIL))],
+        ['folded header', mpAll(B, mpGood(B), `--${B}${C}` + mpPart(`Content-Disposition: form-data;${C} name="email"`, EVIL))],
+        ['folded header, tab', mpAll(B, mpGood(B), `--${B}${C}` + mpPart(`Content-Disposition: form-data;${C}\tname="email"`, EVIL))],
+        ['your[email', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="your[email"', EVIL))],
+        ['email[', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="email["', EVIL))],
+        ['escaped quote in the name', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="em\\ail"', EVIL))],
+        ['an extra header that mentions email', mpAll(B, mpGood(B), `--${B}${C}` + mpPart(`Content-Disposition: form-data; name="x"${C}X-Field: EMAIL`, EVIL))],
+        ['a file part whose header mentions email', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="up"; filename="email.txt"', EVIL))],
+        ['LF-only line breaks', `--${B}\nContent-Disposition: form-data; name="email"\n\n${GOOD}\n--${B}\nContent-Disposition: form-data; name="Your-Email"\n\n${EVIL}\n--${B}--\n`],
+    ];
+    for (const [name, body] of cases) {
+        const worker = await runHandler(multipartRequest(body, `multipart/form-data; boundary=${B}`), { status: 'valid' });
+        assert.deepStrictEqual(validated(worker.calls), [GOOD], name);
+        assert.ok(worker.text.includes(GOOD), name);
+        assert.ok(!worker.text.includes(EVIL), name);
+    }
+    const urlCases = [
+        'your_email=good%40ok.example&your[email=evil%40bad.example',
+        'email=good%40ok.example&email[]=evil%40bad.example',
+        'email=good%40ok.example&%09email=evil%40bad.example',
+        'your-email=good%40ok.example&your+email=evil%40bad.example',
+        'email=good%40ok.example&email%5B=evil%40bad.example',
+        'email=good%40ok.example&EMAIL=evil%40bad.example',
+        'email=good%40ok.example&e%6Dail=evil%40bad.example',
+        'your_email=good%40ok.example&your.email=evil%40bad.example',
+    ];
+    for (const body of urlCases) {
+        const worker = await runHandler(formRequest(body), { status: 'valid' });
+        assert.deepStrictEqual(validated(worker.calls), [GOOD], body);
+        assert.ok(!worker.text.includes('evil'), body);
+    }
+});
+
+test('R3 e2e: a rejected address leaves no address in any email field', async () => {
+    const worker = await runHandler(formRequest('Email=a%40x.com&your.email=b%40x.com&notes=c%40x.com&emailCopy=d%40x.com'), { status: 'invalid' });
+    assert.strictEqual(worker.calls.validation.length, 1);
+    assert.strictEqual(worker.text, 'Email=INVALID&your.email=INVALID&notes=c%40x.com&emailCopy=INVALID');
+});
+
+test('R3: the choice - exact name first, then any email field holding an address, then any field; a non-address is never sent', async () => {
+    const one = async (body, ct) => {
+        const w = ct ? await runHandler(multipartRequest(body, ct), { status: 'valid' }) : await runHandler(formRequest(body), { status: 'valid' });
+        return validated(w.calls);
+    };
+    assert.deepStrictEqual(await one('myemail=a%40x.com&email=b%40x.com'), ['b@x.com']);
+    assert.deepStrictEqual(await one('myemail=a%40x.com&your_email=b%40x.com'), ['b@x.com']);
+    assert.deepStrictEqual(await one('myemail=a%40x.com&note=b%40x.com'), ['a@x.com']);
+    assert.deepStrictEqual(await one('email=junk&note=b%40x.com&myemail=c%40x.com'), ['c@x.com']);
+    assert.deepStrictEqual(await one('email=junk&note=b%40x.com'), ['b@x.com']);
+    assert.deepStrictEqual(await one('email=junk&note=more'), []);
+    assert.deepStrictEqual(await one(mpAll('B', `--B${C}` + mpPart('Content-Disposition: form-data; name="x-email"', 'a@x.com'), mpGood('B')), 'multipart/form-data; boundary=B'), [GOOD]);
+});
+
+test('R3: a file part is read only when its header block mentions email', async () => {
+    const B = 'B';
+    const plain = mpAll(B, `--${B}${C}` + mpPart('Content-Disposition: form-data; name="doc"; filename="a.txt"', GOOD));
+    const w = await runHandler(multipartRequest(plain, `multipart/form-data; boundary=${B}`), { status: 'invalid' });
+    assert.strictEqual(w.calls.validation.length, 0);
+    assert.strictEqual(w.text, plain);
+    // Binary file bytes in an email-named file part that are not an address stay as they are.
+    const bin = mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="email"; filename="a.bin"', 'not an address'));
+    const kept = await runHandler(multipartRequest(bin, `multipart/form-data; boundary=${B}`), { status: 'valid' });
+    assert.strictEqual(kept.text, bin);
+});
+
+test('R3: an email part with a transfer encoding is INVALID; a header block mentioning email is read case-insensitively', async () => {
+    const B = 'B';
+    const body = mpAll(B, mpGood(B), `--${B}${C}` + mpPart(`Content-Disposition: form-data; name="n"${C}Content-Transfer-Encoding: base64${C}X-A: EmAiL`, 'ZXZpbEBiYWQuZXhhbXBsZQ=='));
+    const w = await runHandler(multipartRequest(body, `multipart/form-data; boundary=${B}`), { status: 'valid' });
+    assert.ok(w.text.includes(`name="n"${C}Content-Transfer-Encoding: base64${C}X-A: EmAiL${C}${C}INVALID${C}`));
+});
+
+test('R3: more than one "boundary" anywhere in the Content-Type is a 400; a boundary value that holds the word is fine', async () => {
+    const body = mpAll('----WebKitFormBoundaryAbc', mpGood('----WebKitFormBoundaryAbc'));
+    const ok = await runHandler(multipartRequest(body, 'multipart/form-data; boundary=----WebKitFormBoundaryAbc'), { status: 'invalid' });
+    assert.strictEqual(ok.calls.validation.length, 1);
+    assert.ok(ok.text.includes('INVALID'));
+    const quoted = await runHandler(multipartRequest(body, 'multipart/form-data; boundary="----WebKitFormBoundaryAbc"'), { status: 'invalid' });
+    assert.strictEqual(quoted.calls.validation.length, 1);
+
+    for (const type of [
+        'multipart/form-data; xboundary=A; boundary=B',
+        'multipart/form-data; x="boundary=A"; boundary=B',
+        'multipart/form-data; a="x;boundary=A"; boundary=B',
+        "multipart/form-data; boundary*=UTF-8''A; boundary=B",
+        'multipart/form-data; boundary=----WebKitFormBoundaryAbc; x=boundary',
+        'multipart/form-data; boundary=Boundary1; boundary=Boundary1',
+    ]) {
+        const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+        const response = await worker.context.handleRequest(fetchEvent(multipartRequest(body, type)));
+        assert.strictEqual(response.status, 400, type);
+        assert.strictEqual(worker.calls.forwarded.length, 0, type);
+        assert.strictEqual(worker.calls.validation.length, 0, type);
+    }
+});
+
+test('R3: boundary="" is not a boundary, and a first line --BBx is not a delimiter for boundary BB', async () => {
+    const body = mpAll('B', mpGood('B'));
+    for (const type of ['multipart/form-data; boundary=""', 'multipart/form-data; boundary=']) {
+        const w = await runHandler(multipartRequest(body, type), { status: 'invalid' });
+        assert.strictEqual(w.calls.validation.length, 0, type);
+        assert.strictEqual(w.text, body, type);
+    }
+    // "--BBx" is not a delimiter for boundary "BB": the only email part is after a real one.
+    const text = `--BBx${C}Content-Disposition: form-data; name="email"${C}${C}${EVIL}${C}--BB${C}Content-Disposition: form-data; name="email"${C}${C}${GOOD}${C}--BB--${C}`;
+    const w = await runHandler(multipartRequest(text, 'multipart/form-data; boundary=BB'), { status: 'valid' });
+    assert.deepStrictEqual(validated(w.calls), [GOOD]);
+});
+
+test('R3: junk after a closing quote in a header parameter does not hide the name', async () => {
+    const B = 'B';
+    for (const header of ['Content-Disposition: form-data; name="email"junk; x=y', 'Content-Disposition: form-data; name="email"junk', 'Content-Disposition: form-data; name="email" junk']) {
+        const body = mpAll(B, `--${B}${C}` + mpPart(header, 'a@x.com'));
+        const w = await runHandler(multipartRequest(body, `multipart/form-data; boundary=${B}`), { status: 'invalid' });
+        assert.deepStrictEqual(validated(w.calls), ['a@x.com'], header);
+        assert.strictEqual(w.text, mpAll(B, `--${B}${C}` + mpPart(header, 'INVALID')), header);
+    }
+});
+
+test('R3: ip_address comes from CF-Connecting-IP, never from X-Forwarded-For', async () => {
+    const { context, calls } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    const request = formRequest('email=a%40x.com', { headers: { 'X-Forwarded-For': '203.0.113.99', 'CF-Connecting-IP': '198.51.100.7' } });
+    await context.handleRequest(fetchEvent(request));
+    assert.strictEqual(calls.validation[0].url.searchParams.get('ip_address'), '198.51.100.7');
+
+    const only = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    const spoof = new Request('https://example.com/f', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'X-Forwarded-For': '203.0.113.99' }, body: 'email=a%40x.com' });
+    await only.context.handleRequest(fetchEvent(spoof));
+    assert.strictEqual(only.calls.validation[0].url.searchParams.has('ip_address'), false);
+});
+
+test('R3: with no LOGS and no list bindings nothing is reported as an error', async () => {
+    const { context, errors, logs } = loadWorker({ API_KEY }, { unbind: ['VALID_STATUS', 'BYPASS_PATH', 'LOGS'] });
+    await context.handleRequest(fetchEvent(formRequest('email=a%40x.com')));
+    assert.deepStrictEqual(errors, []);
+    assert.ok(!logs.some((line) => line.startsWith('Ignoring')));
+});
+
+test('R3: a LOGS.put that rejects is logged as a redacted error and does not stop the request', async () => {
+    const LOGS = { put: async () => { throw new Error(`KV down ${API_KEY}`); } };
+    const { context, calls, errors } = loadWorker({ API_KEY, VALID_STATUS: ['valid'], LOGS });
+    const { event, waits } = waitingEvent(formRequest('email=a%40x.com'));
+    await context.handleRequest(event);
+    assert.strictEqual(waits.length, 1);
+    await Promise.all(waits);
+    assert.strictEqual(calls.forwarded.length, 1);
+    assert.ok(errors.some((line) => line.includes('Unable to write the validation log to KV')));
+    for (const line of errors) assert.ok(!line.includes(API_KEY), line);
+});
+
+test('R3: the Content-Type is logged as its media type only, cut at 100 characters, and a huge one is cheap', async () => {
+    const huge = `multipart/form-data; boundary=B; x=${'a'.repeat(65000)}`;
+    const { context, logs } = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    const start = Date.now();
+    await context.handleRequest(fetchEvent(multipartRequest(mpAll('B', mpGood('B')), huge)));
+    assert.ok(Date.now() - start < 2000);
+    const line = logs.find((l) => l.startsWith('Incoming content type'));
+    assert.strictEqual(line, 'Incoming content type: multipart/form-data');
+    assert.ok(!logs.some((l) => l.includes('aaaaaaaa')));
+
+    const long = await loadWorker({ API_KEY });
+    await long.context.handleRequest(fetchEvent(new Request('https://example.com/f', { method: 'POST', headers: { 'content-type': `text/${'z'.repeat(300)}` }, body: 'x' })));
+    const cut = long.logs.find((l) => l.startsWith('Incoming content type'));
+    assert.strictEqual(cut.length, 'Incoming content type: '.length + 100);
+});
+
+test('R3: truncateUtf8 keeps exactly 512 bytes and never splits a code point', () => {
+    const { context } = loadWorker({ API_KEY });
+    assert.strictEqual(context.truncateUtf8('a'.repeat(512), 512).length, 512);
+    assert.strictEqual(context.truncateUtf8('a'.repeat(513), 512).length, 512);
+    assert.strictEqual(context.truncateUtf8('é'.repeat(256), 512), 'é'.repeat(256));
+    assert.strictEqual(context.truncateUtf8('é'.repeat(257), 512), 'é'.repeat(256));
+    assert.strictEqual(context.truncateUtf8('a'.repeat(511) + 'é', 512), 'a'.repeat(511));
+    assert.strictEqual(context.truncateUtf8('a'.repeat(509) + '\u{1F600}', 512), 'a'.repeat(509));
+    assert.strictEqual(context.truncateUtf8('a'.repeat(508) + '\u{1F600}', 512), 'a'.repeat(508) + '\u{1F600}');
 });
