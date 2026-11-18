@@ -81,16 +81,19 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   `replaceFieldValues` swaps only the rejected value. Every other byte must reach the origin as sent.
 - **Multipart bodies are never decoded as a whole either.** `multipartFields` splits the raw body on its boundary
   and reads the headers and value of each part as a one-character-per-byte string, so offsets are byte offsets. File
-  parts are skipped unless their headers mention `email`. `chooseAddressField` picks the address and
+  parts (a `filename=` or `filename*=` value, even empty) are never read or changed; a bare `filename` is a text field. `chooseAddressField` picks the address and
   `fieldsToRewrite` lists the fields to change; `replaceFieldValues` then swaps only those values. A UTF-8 decode and re-encode of
   the body would replace every non-UTF-8 byte of an uploaded file with U+FFFD.
-- **Content types are compared by media type** (`mediaType`: lower case, parameters dropped), never with `===` on the
-  header or with `includes`.
+- **Content types are compared by media type** (`mediaType`: lower case, parameters dropped) wherever the JSON branch
+  is chosen: only `application/json` goes there. `contentTypeKind` does look for the form types inside the whole header
+  (lower case), but it then refuses the request with a 400 unless the text before the first `;` is exactly that form
+  type, so a loose match never selects a branch.
 - **The Content-Type of a rewritten request is inherited from the incoming request.** When you change a body, keep its
   encoding: handing a `FormData` object to a request that still carries
   `Content-Type: application/x-www-form-urlencoded` produces a multipart body the origin cannot parse.
-- **Keep the pass-through guarantee.** Every branch ends in `return await fetch(request)`, except the
-  `400 Bad Request` answer for an ambiguous multipart `boundary`, which returns a `Response` and never reaches the origin.
+- **Keep the pass-through guarantee.** Every branch ends in `return await fetch(request)` (or a forward of a rewritten
+  copy of it), except the `400 Bad Request` answers, which return a `Response` and never reach the origin: an
+  ambiguous `Content-Type`, a bad or repeated `boundary`, and a malformed multipart body.
   `event.passThroughOnException()` means a thrown error silently forwards to the origin. A change that can hang or
   throw before that point breaks the customer's form instead of their bad addresses.
 - **Fail open, but never silently.** A validation that yields no status (dead key, timeout, redirect, network error)

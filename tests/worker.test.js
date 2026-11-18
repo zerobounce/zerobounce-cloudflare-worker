@@ -1384,20 +1384,19 @@ test('H1: only the value bytes are replaced; the whitespace around them stays', 
     assert.strictEqual(text, mpBody(field('email', '  \tINVALID \n ')));
 });
 
-test('H1: a filename (or filename*) marks a file, unless the part header mentions email', async () => {
+test('H1: a filename (or filename*) with a value marks a file, whatever the part header mentions', async () => {
     const file = 'Content-Disposition: form-data; name="doc"; filename="x.txt"\r\n\r\nsomeone@x.com';
     const star = 'Content-Disposition: form-data; name="doc2"; filename*=UTF-8\'\'a.txt\r\n\r\nsomeone@x.com';
     const { calls } = await runHandler(mpRequest(mpBody(file, star)));
 
     assert.strictEqual(calls.validation.length, 0);
 
-    // A filename that quotes name="email" is a header that mentions email: the
-    // part is read (an origin may take it for the field), and rewritten when it holds an address.
+    // A filename that quotes name="email" is still a file: PHP and undici
+    // keep it out of the form fields, so it is never read and never rewritten.
     const text = mpBody('Content-Disposition: form-data; name="x"; filename="a; name=email"\r\n\r\nsomeone@x.com');
-    const read = await runHandler(mpRequest(text), { status: 'valid' });
-    assert.deepStrictEqual(validated(read.calls), ['someone@x.com']);
-    const rejected = await runHandler(mpRequest(text));
-    assert.strictEqual(rejected.text, mpBody('Content-Disposition: form-data; name="x"; filename="a; name=email"\r\n\r\nINVALID'));
+    const read = await runHandler(mpRequest(text));
+    assert.strictEqual(read.calls.validation.length, 0);
+    assert.strictEqual(read.text, text);
 });
 
 test('H1: a text part whose name hides in a quoted parameter value is read by its real name', async () => {
@@ -1981,7 +1980,7 @@ test('R2 bypass: in fallback mode a repeat of the found field is rewritten, and 
 });
 
 test('R2 bypass: multipart names are matched the way PHP reads them', async () => {
-    for (const name of [' email', 'your.email', 'your email', 'email\0x', '\temail']) {
+    for (const name of [' email', 'your.email', 'your email', '\temail']) {
         const body = mpBody(field('email', 'g@ok.example'), field(name, 'e@bad.example'));
         const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
         assert.deepStrictEqual(validated(calls), ['g@ok.example'], JSON.stringify(name));
@@ -1991,35 +1990,47 @@ test('R2 bypass: multipart names are matched the way PHP reads them', async () =
 
 // --- multipart bypasses -----------------------------------------------------
 
-test('R2 bypass: a part named like an email field is a candidate even with a filename', async () => {
-    for (const extra of ['filename', 'filename=""', 'filename="a.txt"', "filename*=UTF-8''a.txt"]) {
+test('R2 bypass: a part named like an email field with a bare filename is a text field; with a filename value it is a file', async () => {
+    // A bare `filename` (no "=") is a text field to PHP: still a candidate.
+    const bare = mpBody(field('email', 'g@ok.example'), disp('name="email"; filename', 'e@bad.example'));
+    const r = await runHandler(mpRequest(bare), { status: 'valid' });
+    assert.deepStrictEqual(validated(r.calls), ['g@ok.example']);
+    assert.strictEqual(r.text, mpBody(field('email', 'g@ok.example'), disp('name="email"; filename', 'INVALID')));
+    // A filename with a value, even an empty one, is a file: never read, never rewritten.
+    for (const extra of ['filename=""', 'filename="a.txt"', "filename*=UTF-8''a.txt", 'filename=a.txt', 'filename*0*=UTF-8\'\'a']) {
         const body = mpBody(field('email', 'g@ok.example'), disp(`name="email"; ${extra}`, 'e@bad.example'));
         const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
         assert.deepStrictEqual(validated(calls), ['g@ok.example'], extra);
-        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), disp(`name="email"; ${extra}`, 'INVALID')), extra);
+        assert.strictEqual(text, body, extra);
     }
-    // Alone, such a part holding an address is validated.
-    const alone = mpBody(disp('name="email"; filename', 'a@x.com'));
-    assert.deepStrictEqual(validated((await runHandler(mpRequest(alone), { status: 'valid' })).calls), ['a@x.com']);
-    // A file part with another name stays unread.
-    const other = mpBody(disp('name="doc"; filename', 'a@x.com'), disp('name="your-doc"; filename="a"', 'b@x.com'));
+    // Alone, such a part is not validated.
+    const alone = mpBody(disp('name="email"; filename="a.txt"', 'a@x.com'));
+    assert.strictEqual((await runHandler(mpRequest(alone), { status: 'valid' })).calls.validation.length, 0);
+    // A bare filename alone is validated.
+    const bareAlone = mpBody(disp('name="email"; filename', 'a@x.com'));
+    assert.deepStrictEqual(validated((await runHandler(mpRequest(bareAlone), { status: 'valid' })).calls), ['a@x.com']);
+    // A file part with another name stays unread; a bare filename is a text field judged as any other.
+    const other = mpBody(disp('name="doc"; filename="a.txt"', 'a@x.com'), disp('name="your-doc"; filename="a"', 'b@x.com'));
     assert.strictEqual((await runHandler(mpRequest(other))).calls.validation.length, 0);
+    const bareOther = mpBody(disp('name="doc"; filename', 'a@x.com'));
+    assert.deepStrictEqual(validated((await runHandler(mpRequest(bareOther), { status: 'valid' })).calls), ['a@x.com']);
 });
 
 test('R2 bypass: a part with two Content-Disposition headers is a candidate if any names a candidate', async () => {
     const twice = (a, b, value) => `Content-Disposition: form-data; ${a}\r\nContent-Disposition: form-data; ${b}\r\n\r\n${value}`;
-    for (const [a, b] of [['name="note"', 'name="email"'], ['name="email"', 'name="note"'], ['name="note"; filename="x"', 'name="your.email"']]) {
+    for (const [a, b] of [['name="note"', 'name="email"'], ['name="email"', 'name="note"'], ['name="note"; filename', 'name="your.email"']]) {
         const body = mpBody(field('email', 'g@ok.example'), twice(a, b, 'e@bad.example'));
         const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
         assert.deepStrictEqual(validated(calls), ['g@ok.example'], `${a} ${b}`);
         assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), twice(a, b, 'INVALID')), `${a} ${b}`);
     }
-    // For every other purpose the first header decides: a first filename makes a file ...
-    const file = mpBody(twice('name="note"; filename="a"', 'name="other"', 'a@x.com'));
-    assert.strictEqual((await runHandler(mpRequest(file))).calls.validation.length, 0);
-    // ... and a first header without one makes a text field, whatever a later one says.
-    const text = mpBody(twice('name="note"', 'name="doc"; filename="a"', 'a@x.com'));
-    assert.deepStrictEqual(validated((await runHandler(mpRequest(text), { status: 'valid' })).calls), ['a@x.com']);
+    // A filename value in any of the headers makes a file: never read, never rewritten.
+    for (const [a, b] of [['name="note"; filename="a"', 'name="other"'], ['name="note"', 'name="doc"; filename="a"'], ['name="email"; filename=""', 'name="email"']]) {
+        const file = mpBody(field('email', 'g@ok.example'), twice(a, b, 'a@x.com'));
+        const result = await runHandler(mpRequest(file), { status: 'valid' });
+        assert.deepStrictEqual(validated(result.calls), ['g@ok.example'], `${a} ${b}`);
+        assert.strictEqual(result.text, file, `${a} ${b}`);
+    }
 });
 
 test('R2: a part whose header mentions email is an email field even when its first name parameter is another', async () => {
@@ -2038,8 +2049,8 @@ test('R2: parameter names are case-insensitive, unquoted values are trimmed, quo
         assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), `Content-Disposition: form-data; ${header}\r\n\r\nINVALID`), header);
     }
     // A header name is trimmed; its case does not matter.
-    const spaced = mpBody(field('email', 'g@ok.example'), 'content-disposition : form-data; name="email"\r\n\r\ne@bad.example');
-    assert.strictEqual((await runHandler(mpRequest(spaced), { status: 'valid' })).text, mpBody(field('email', 'g@ok.example'), 'content-disposition : form-data; name="email"\r\n\r\nINVALID'));
+    const lower = mpBody(field('email', 'g@ok.example'), 'content-disposition: form-data; name="email"\r\n\r\ne@bad.example');
+    assert.strictEqual((await runHandler(mpRequest(lower), { status: 'valid' })).text, mpBody(field('email', 'g@ok.example'), 'content-disposition: form-data; name="email"\r\n\r\nINVALID'));
 });
 
 test('R2 bypass: the boundary parameter is parsed as a header parameter', async () => {
@@ -2127,18 +2138,106 @@ test('R2 bypass: a delimiter line is the boundary and nothing else but blanks an
     assert.strictEqual((await runHandler(mpRequest(cr), { status: 'valid' })).calls.validation.length, 0);
 });
 
-test('R2: nothing after the closing delimiter is read', async () => {
+test('strict multipart: the boundary again after the closing delimiter is answered 400', async () => {
     const epilogue = `--zb-b\r\n${field('n', '1')}\r\n--zb-b--\r\n--zb-b\r\n${field('email', 'e@bad.example')}\r\n--zb-b--\r\n`;
-    const { calls, text } = await runHandler(mpRequest(epilogue), { status: 'valid' });
-    assert.strictEqual(calls.validation.length, 0);
-    assert.strictEqual(text, epilogue);
+    await assertRefused400(mpRequest(epilogue));
+    // The boundary text inside a longer line is still the boundary again.
+    await assertRefused400(mpRequest(`--zb-b\r\n${field('n', '1')}\r\n--zb-b--\r\nx--zb-b`));
+    // A plain epilogue is fine (browsers send "--B--\r\n").
+    for (const tail of ['', '\r\n', '\n', 'epilogue text\r\n', '--zb', '-- zb-b']) {
+        const body = `--zb-b\r\n${field('email', 'g@ok.example')}\r\n--zb-b--${tail}`;
+        const { calls } = await runHandler(mpRequest(body), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], JSON.stringify(tail));
+    }
 });
 
-test('R2: a part with no blank line after its headers has no value and is not read', async () => {
-    const body = mpBody('Content-Disposition: form-data; name="email"\r\nc@x.com');
-    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
-    assert.strictEqual(calls.validation.length, 0);
-    assert.strictEqual(text, body);
+test('strict multipart: a part with no blank line after its headers is answered 400', async () => {
+    await assertRefused400(mpRequest(mpBody('Content-Disposition: form-data; name="email"\r\nc@x.com')));
+    await assertRefused400(mpRequest(mpBody(field('n', '1'), 'Content-Disposition: form-data; name="x"')));
+});
+
+test('strict multipart: no closing delimiter is answered 400', async () => {
+    await assertRefused400(mpRequest(`--zb-b\r\n${field('email', 'g@ok.example')}\r\n`));
+    await assertRefused400(mpRequest(`--zb-b\r\n${field('email', 'g@ok.example')}`));
+    await assertRefused400(mpRequest(`--zb-b\r\n${field('email', 'g@ok.example')}\r\n--zb-bx\r\n`));
+    await assertRefused400(mpRequest('email=a%40x.com'));
+    await assertRefused400(mpRequest(''));
+    await assertRefused400(mpRequest('--zb-b'));
+});
+
+test('strict multipart: a header line that is not "Name: value" or a fold, or holds NUL or a bare CR, is answered 400', async () => {
+    const bad = [
+        'Content-Disposition: form-data; name="email"\r\njunk line\r\n\r\na@x.com',
+        'Content-Disposition: form-data; name="email"\r\n: nameless\r\n\r\na@x.com',
+        'Content-Disposition: form-data; name="email"\r\nX Y: spaced name\r\n\r\na@x.com',
+        'Content-Disposition : form-data; name="email"\r\n\r\na@x.com',
+        'Content-Disposition: form-data; name="email"\r\nX-A: b\0c\r\n\r\na@x.com',
+        'Content-Disposition: form-data; name="em\0ail"\r\n\r\na@x.com',
+        'Content-Disposition: form-data; name="email"\r\nX-A: b\rc\r\n\r\na@x.com',
+        'junk\r\nContent-Disposition: form-data; name="email"\r\n\r\na@x.com',
+    ];
+    for (const part of bad) {
+        await assertRefused400(mpRequest(mpBody(field('email', 'g@ok.example'), part)), JSON.stringify(part));
+    }
+    // Folds (a tab or a space), a header with no space after the colon, and no header line at all are fine.
+    const good = [
+        'Content-Disposition: form-data;\r\n\tname="email"\r\n\r\na@x.com',
+        'Content-Disposition:form-data; name="email"\r\n\r\na@x.com',
+        'Content-Disposition: form-data; name="email"\r\nX-Custom_Header.1: v\r\n\r\na@x.com',
+        '\r\nplain',
+    ];
+    for (const part of good) {
+        const { calls } = await runHandler(mpRequest(mpBody(part)), { status: 'valid' });
+        assert.ok(calls.forwarded.length === 1, JSON.stringify(part));
+    }
+});
+
+test('strict multipart: a refused body has no API call, no origin call and one error line', async () => {
+    const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    const response = await worker.context.handleRequest(fetchEvent(mpRequest(`--zb-b\r\n${field('email', 'g@ok.example')}\r\n`)));
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(await response.text(), 'Bad Request');
+    assert.match(response.headers.get('content-type'), /^text\/plain/);
+    assert.strictEqual(worker.calls.forwarded.length, 0);
+    assert.strictEqual(worker.calls.validation.length, 0);
+    assert.strictEqual(worker.errors.length, 1);
+});
+
+test('strict multipart: bodies as real clients send them are accepted', async () => {
+    const part = (name, value, extra = '') => `Content-Disposition: form-data; name="${name}"${extra}\r\n\r\n${value}`;
+    const styles = {
+        chrome: ['----WebKitFormBoundaryAbC123xyz', (b) => `------WebKitFormBoundaryAbC123xyz\r\n${part('email', 'g@ok.example')}\r\n------WebKitFormBoundaryAbC123xyz\r\n${part('f', 'bin', '; filename="a.png"\r\nContent-Type: image/png')}\r\n------WebKitFormBoundaryAbC123xyz--\r\n`],
+        firefox: ['---------------------------123456789012345678901234567', () => `-----------------------------123456789012345678901234567\r\n${part('email', 'g@ok.example')}\r\n-----------------------------123456789012345678901234567--\r\n`],
+        curl: ['------------------------abcdef0123456789', () => `--------------------------abcdef0123456789\r\n${part('email', 'g@ok.example')}\r\n--------------------------abcdef0123456789\r\n${part('f', 'x', '; filename="a.txt"\r\nContent-Type: text/plain')}\r\n--------------------------abcdef0123456789--\r\n`],
+        python: ['a1b2c3d4e5f60718293a4b5c6d7e8f90', () => `--a1b2c3d4e5f60718293a4b5c6d7e8f90\r\n${part('email', 'g@ok.example')}\r\n--a1b2c3d4e5f60718293a4b5c6d7e8f90\r\n${part('f', 'x', '; filename="a.txt"')}\r\n--a1b2c3d4e5f60718293a4b5c6d7e8f90--\r\n`],
+        phpcurl: ['------------------------0123456789abcdef', () => `--------------------------0123456789abcdef\r\nContent-Disposition: form-data; name="email"\r\n\r\ng@ok.example\r\n--------------------------0123456789abcdef--\r\n`],
+        undici: ['----formdata-undici-012345678901', () => `------formdata-undici-012345678901\r\nContent-Disposition: form-data; name="email"\r\n\r\ng@ok.example\r\n------formdata-undici-012345678901\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\nx\r\n------formdata-undici-012345678901--\r\n`],
+        go: ['0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab', () => `--0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\r\nContent-Disposition: form-data; name="email"\r\n\r\ng@ok.example\r\n--0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab--\r\n`],
+    };
+    for (const [style, [boundary, make]] of Object.entries(styles)) {
+        const body = make(boundary);
+        const { calls, text } = await runHandler(multipartRequest(body, `multipart/form-data; boundary=${boundary}`), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], style);
+        assert.strictEqual(text, body, style);
+    }
+});
+
+test('strict multipart: a malformed-body scan over 200k bytes of blanks, CR, LF, dashes, colons and NUL takes linear time', async () => {
+    for (const filler of [' ', '\r', '\n', '-', ':', '\0', '"', '\r\n', '--zb-b', '-\r\n']) {
+        const run = filler.repeat(Math.ceil(200000 / filler.length));
+        const shapes = [
+            `--zb-b\r\nContent-Disposition: form-data; name="email"\r\n${run}\r\n\r\na@x.com\r\n--zb-b--\r\n`,
+            `--zb-b\r\n${run}`,
+            `--zb-b\r\n${field('n', run)}\r\n--zb-b--\r\n${run}`,
+            `${run}--zb-b\r\nX: ${run}\r\n\r\n${run}`,
+        ];
+        for (const body of shapes) {
+            const started = Date.now();
+            const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+            await worker.context.handleRequest(fetchEvent(mpRequest(body)));
+            assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms for ${JSON.stringify(filler)}`);
+        }
+    }
 });
 
 test('R2 bypass: a candidate part with a transfer encoding is rewritten to INVALID when VALID_STATUS is set', async () => {
@@ -2504,7 +2603,6 @@ test('R3 e2e: no address other than the validated one stays in a field or part w
         ['email[', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="email["', EVIL))],
         ['escaped quote in the name', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="em\\ail"', EVIL))],
         ['an extra header that mentions email', mpAll(B, mpGood(B), `--${B}${C}` + mpPart(`Content-Disposition: form-data; name="x"${C}X-Field: EMAIL`, EVIL))],
-        ['a file part whose header mentions email', mpAll(B, mpGood(B), `--${B}${C}` + mpPart('Content-Disposition: form-data; name="up"; filename="email.txt"', EVIL))],
         ['LF-only line breaks', `--${B}\nContent-Disposition: form-data; name="email"\n\n${GOOD}\n--${B}\nContent-Disposition: form-data; name="Your-Email"\n\n${EVIL}\n--${B}--\n`],
     ];
     for (const [name, body] of cases) {
@@ -2681,6 +2779,14 @@ test('R3: truncateUtf8 keeps exactly 512 bytes and never splits a code point', (
 // Round 4: email-field values that are not plain addresses, Content-Type and
 // boundary handling, RFC 2231 names
 // ---------------------------------------------------------------------------
+
+async function assertRefused400(request, label = '') {
+    const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    const response = await worker.context.handleRequest(fetchEvent(request));
+    assert.strictEqual(response.status, 400, label);
+    assert.strictEqual(worker.calls.forwarded.length, 0, label);
+    assert.strictEqual(worker.calls.validation.length, 0, label);
+}
 
 async function refusedWith400(type, body = 'email=a%40x.com') {
     const w = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
@@ -3034,4 +3140,169 @@ test('R4-5: list bindings: U+201A, guillemet-like quotes, JSON arrays with a non
     const bypass = await runHandler(formRequest('email=bad%40x.com', { url: 'https://example.com/a,b' }), { bindings: { BYPASS_PATH: '["/a,b"]' }, status: 'invalid' });
     assert.strictEqual(bypass.text, 'email=bad%40x.com');
     assert.strictEqual(bypass.calls.validation.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Round 5
+// ---------------------------------------------------------------------------
+
+test('round 5: file parts reach the origin byte for byte, whatever their headers or filenames say', async () => {
+    const enc = new TextEncoder();
+    const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x40, 0x40, 0x00, 0xff, 0x40]);
+    const parts = [
+        ['Content-Disposition: form-data; name="doc"; filename="my-email.eml"\r\nContent-Type: message/rfc822\r\n\r\n', enc.encode('From: someone@bad.example\r\n\r\nhi')],
+        ['Content-Disposition: form-data; name="email_list"; filename="list.csv"\r\nContent-Type: text/csv\r\n\r\n', enc.encode('a@bad.example,b@bad.example\n')],
+        ['Content-Disposition: form-data; name="email"; filename=""\r\n\r\n', enc.encode('c@bad.example')],
+        ['Content-Disposition: form-data; name="x"; filename*=UTF-8\'\'email.txt\r\n\r\n', enc.encode('d@bad.example')],
+        ['Content-Disposition: form-data; name="img"; filename="e.png"\r\nContent-Type: image/png\r\nX-Note: email\r\n\r\n', png],
+    ];
+    const chunks = [enc.encode('--zb-b\r\nContent-Disposition: form-data; name="email"\r\n\r\ng@ok.example\r\n')];
+    for (const [head, content] of parts) {
+        chunks.push(enc.encode('--zb-b\r\n'), enc.encode(head), content, enc.encode('\r\n'));
+    }
+    chunks.push(enc.encode('--zb-b--\r\n'));
+    const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of chunks) { all.set(c, at); at += c.length; }
+
+    for (const status of ['valid', 'invalid']) {
+        const { calls, body } = await runHandler(mpRequest(all), { status });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example']);
+        const expected = status === 'valid' ? all : new TextEncoder().encode(new TextDecoder('latin1').decode(all).replace('g@ok.example', 'INVALID'));
+        if (status === 'valid') {
+            assert.deepStrictEqual(Buffer.from(body), Buffer.from(expected));
+        } else {
+            // Only the email value changed: every other byte, file bytes included, is the same.
+            const before = Buffer.from(all);
+            const after = Buffer.from(body);
+            const marker = Buffer.from('g@ok.example');
+            const index = before.indexOf(marker);
+            assert.deepStrictEqual(after, Buffer.concat([before.subarray(0, index), Buffer.from('INVALID'), before.subarray(index + marker.length)]));
+        }
+    }
+});
+
+test('round 5: forwardWithBody does not carry the incoming Content-Length', async () => {
+    const stale = new Request('https://example.com/subscribe', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': '999', 'CF-Connecting-IP': '198.51.100.7' },
+        body: 'email=bad%40x.com',
+    });
+    assert.strictEqual(stale.headers.get('content-length'), '999');
+    const { calls, text } = await runHandler(stale, { status: 'invalid' });
+    assert.strictEqual(text, 'email=INVALID');
+    assert.strictEqual(calls.forwarded[0].headers.get('content-length'), null);
+    // The other headers stay.
+    assert.strictEqual(calls.forwarded[0].headers.get('content-type'), 'application/x-www-form-urlencoded');
+    assert.strictEqual(calls.forwarded[0].headers.get('CF-Connecting-IP'), '198.51.100.7');
+    // The multipart and JSON paths too.
+    const mp = new Request('https://example.com/upload', {
+        method: 'POST',
+        headers: { 'content-type': `multipart/form-data; boundary=${MP}`, 'content-length': '5' },
+        body: mpBody(field('email', 'bad@x.com')),
+    });
+    assert.strictEqual((await runHandler(mp, { status: 'invalid' })).calls.forwarded[0].headers.get('content-length'), null);
+});
+
+test('round 5: list entries are trimmed in linear time', async () => {
+    const { context } = loadWorker({ API_KEY });
+    for (const filler of [' ', ',', ';', '|', '\t', ', ']) {
+        const run = filler.repeat(Math.ceil(200000 / filler.length));
+        const started = Date.now();
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(context.listEntries([`${run}a${run}b${run}`]))), [`a${run}b`]);
+        context.listEntries(`${run}x`);
+        assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms for ${JSON.stringify(filler)}`);
+    }
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(context.listEntries([' ,;| a b ;,| ', ',', '  ']))), ['a b']);
+});
+
+test('round 5 E7: a 2xx result with a non-string error member fails open', async () => {
+    const answer = async (extra) => {
+        const { context } = loadWorker({ API_KEY });
+        context.fetch = async () => new Response(JSON.stringify({ status: 'invalid', address: 'a@x.com', ...extra }), { status: 200, headers: { 'content-type': 'application/json' } });
+        return context.validateEmail('a@x.com', null);
+    };
+    for (const key of ['error', 'error_message', 'Error']) {
+        for (const value of [5, -1, 0.5, true, { code: 1 }, ['x'], 'text']) {
+            const result = await answer({ [key]: value });
+            assert.strictEqual(typeof result, 'string', `${key}=${JSON.stringify(value)}`);
+        }
+        // Empty values are no error.
+        for (const value of [0, false, null, '', '  ', [], {}]) {
+            const result = await answer({ [key]: value });
+            assert.strictEqual(typeof result, 'object', `${key}=${JSON.stringify(value)}`);
+        }
+    }
+    // End to end: the address is not rewritten.
+    for (const value of [5, true]) {
+        const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { status: 'invalid', address: 'bad@x.com', error: value } });
+        await worker.context.handleRequest(fetchEvent(formRequest('email=bad%40x.com')));
+        assert.strictEqual(worker.calls.validation.length, 1);
+        assert.strictEqual(new TextDecoder().decode(new Uint8Array(await worker.calls.forwarded[0].arrayBuffer())), 'email=bad%40x.com');
+    }
+});
+
+test('round 5: a raw field name that merely contains email counts as an email field', async () => {
+    // "%1email" does not percent-decode ("%1e" is no escape); the name still holds email.
+    const url = await runHandler(formRequest('%1email=e%40bad.example&email=g%40ok.example'), { status: 'valid' });
+    assert.deepStrictEqual(validated(url.calls), ['g@ok.example']);
+    assert.strictEqual(url.text, '%1email=INVALID&email=g%40ok.example');
+    const mp = await runHandler(mpRequest(mpBody(field('email', 'g@ok.example'), field('%1email', 'e@bad.example'))), { status: 'valid' });
+    assert.deepStrictEqual(validated(mp.calls), ['g@ok.example']);
+    assert.strictEqual(mp.text, mpBody(field('email', 'g@ok.example'), field('%1email', 'INVALID')));
+    // An encoded name that decodes to email.
+    const enc = await runHandler(formRequest('email=g%40ok.example&%65mail=e%40bad.example'), { status: 'valid' });
+    assert.strictEqual(enc.text, 'email=g%40ok.example&%65mail=INVALID');
+});
+
+test('round 5: an exact RFC 2231 name is preferred over an earlier email-like name', async () => {
+    const first = field('x_email', 'first@x.com');
+    const star = "Content-Disposition: form-data; name*=UTF-8''email\r\n\r\nsecond@x.com";
+    const { calls } = await runHandler(mpRequest(mpBody(first, star)), { status: 'valid' });
+    assert.deepStrictEqual(validated(calls), ['second@x.com']);
+    const encoded = "Content-Disposition: form-data; name*=UTF-8''%65mail\r\n\r\nthird@x.com";
+    const e = await runHandler(mpRequest(mpBody(first, encoded)), { status: 'valid' });
+    assert.deepStrictEqual(validated(e.calls), ['third@x.com']);
+    // Same text without the star: a plain name field is the exact one.
+    const plain = await runHandler(mpRequest(mpBody(first, field('email', 'second@x.com'))), { status: 'valid' });
+    assert.deepStrictEqual(validated(plain.calls), ['second@x.com']);
+});
+
+test('round 5: an address of 255 to 320 characters is accepted, one of 321 is not', async () => {
+    const make = (length) => `${'a'.repeat(length - '@x.com'.length)}@x.com`;
+    for (const length of [254, 255, 300, 320]) {
+        const address = make(length);
+        assert.strictEqual(address.length, length);
+        const { calls } = await runHandler(formRequest(`email=${address.replace('@', '%40')}`), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), [address], String(length));
+    }
+    const long = make(321);
+    const refused = await runHandler(formRequest(`email=${long.replace('@', '%40')}`), { status: 'valid' });
+    assert.strictEqual(refused.calls.validation.length, 0);
+    const { context } = loadWorker({ API_KEY });
+    assert.strictEqual(context.isAddress(make(320)), true);
+    assert.strictEqual(context.isAddress(make(321)), false);
+});
+
+test('round 5: a trailing %0D, %0A, %20 or + in a url-encoded value is trimmed before validation', async () => {
+    for (const tail of ['%0D', '%0A', '%0D%0A', '%20', '+', '%09']) {
+        const { calls, text } = await runHandler(formRequest(`email=g%40ok.example${tail}&n=1`), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], tail);
+        assert.strictEqual(text, `email=g%40ok.example${tail}&n=1`, tail);
+    }
+    const lead = await runHandler(formRequest('email=%0D%0Ag%40ok.example'), { status: 'valid' });
+    assert.deepStrictEqual(validated(lead.calls), ['g@ok.example']);
+});
+
+test('round 5: apiErrorText skips whitespace-only text under every key', async () => {
+    const { context } = loadWorker({ API_KEY });
+    const fallback = 'ZeroBounce returned no validation status.';
+    for (const key of ['error', 'error_message', 'Error', 'message', 'Message', 'detail']) {
+        assert.strictEqual(context.apiErrorText({ [key]: ' \t\r\n ' }), fallback, key);
+        assert.strictEqual(context.apiErrorText({ [key]: '' }), fallback, key);
+        assert.strictEqual(context.apiErrorText({ [key]: '  text  ' }), 'text', key);
+        // A whitespace-only value does not stop the search for the next key.
+        assert.strictEqual(context.apiErrorText({ [key]: ' ', ...(key === 'detail' ? { message: 'later' } : { detail: 'later' }) }), 'later', key);
+    }
+    assert.strictEqual(context.apiErrorText({ message: ' ' }, 'custom'), 'custom');
 });

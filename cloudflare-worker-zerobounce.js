@@ -238,8 +238,9 @@ function indexOfBytes(bytes, pattern, from = 0, to = bytes.length) {
 
 /**
  * The parameters of a header value (the text after the first ";") as a list of
- * [name, value, quoted] in order, names in lower case (quoted: the value was a
- * quoted string): a linear scan that honours
+ * [name, value, quoted, assigned] in order, names in lower case (quoted: the
+ * value was a quoted string; assigned: the parameter has an "=", even with an
+ * empty value): a linear scan that honours
  * quoted strings (with backslash escapes), so a filename that merely contains
  * `name="email"` does not set the field name.
  */
@@ -254,7 +255,8 @@ function headerParameterList(text) {
         const paramName = text.slice(nameStart, i).trim().toLowerCase();
         let value = '';
         let quoted = false;
-        if (text[i] === '=') {
+        const assigned = text[i] === '=';
+        if (assigned) {
             i += 1;
             while (i < text.length && /[ \t]/.test(text[i])) i++;
             if (text[i] === '"') {
@@ -274,7 +276,7 @@ function headerParameterList(text) {
             }
         }
         if (paramName) {
-            params.push([paramName, value, quoted]);
+            params.push([paramName, value, quoted, assigned]);
         }
     }
     return params;
@@ -315,15 +317,24 @@ const IDENTITY_ENCODINGS = ['7bit', '8bit', 'binary'];
  * value (so a replacement keeps the whitespace around it). A part is found by
  * its delimiter line and read header by header up to the first blank line
  * (CRLF or bare LF). A delimiter line is "--boundary" followed only by spaces
- * or tabs and a line break, or by "--" (the closing delimiter, after which
- * everything is epilogue and never read).
+ * or tabs and a line break, or by "--" (the closing delimiter).
+ *
+ * The body must be well formed, or the array carries `malformed` (a reason
+ * text; null otherwise) and the Worker answers 400: PHP and undici read bytes
+ * the Worker would skip. Malformed is: a header line that is neither
+ * `Token: value` nor a fold (a line starting with a space or tab), a bare CR
+ * or a NUL byte in a header block, a part whose headers have no blank line
+ * after them, no closing delimiter, or the boundary again after the closing
+ * delimiter (an epilogue such as "\r\n" is fine).
  *
  * A part is an email field (`email: true`) when its raw header block (every
  * header line up to the blank line, folded lines included) contains "email",
  * whatever the syntax of its Content-Disposition: the Worker does not try to
- * read names the way each origin does. A part with a filename (or a filename*)
- * is a file and is skipped, its bytes never read as an address and never
- * rewritten, unless it is an email field. The name is the parsed
+ * read names the way each origin does. A part whose Content-Disposition has a
+ * filename or filename* parameter with an "=" (even `filename=""`) is a file
+ * to PHP and undici: it is skipped, its bytes never read as an address and
+ * never rewritten, whatever its headers or its filename say. A bare `filename`
+ * with no "=" is a text field to PHP and is judged by its headers. The name is the parsed
  * Content-Disposition `name` (one that is exactly email, your-email or
  * your_email is preferred when a part repeats the header), or '' when none
  * parses. An email part with a transfer encoding other than 7bit, 8bit or
@@ -357,11 +368,17 @@ function multipartFields(bytes, boundary) {
 
     let delimiter = indexOfBytes(bytes, dashes, 0, dashes.length) === 0 && delimiterAt(0) ? 0 : nextDelimiter(0);
     const fields = [];
+    fields.malformed = null;
+    let closed = false;
 
     while (delimiter !== -1) {
         const after = delimiter + dashes.length;
-        // The closing delimiter ends with "--".
+        // The closing delimiter ends with "--"; the boundary must not come again after it.
         if (bytes[after] === 0x2d && bytes[after + 1] === 0x2d) {
+            closed = true;
+            if (indexOfBytes(bytes, dashes, after + 2) !== -1) {
+                fields.malformed = 'the boundary appears again after the closing delimiter';
+            }
             break;
         }
         const lineEnd = bytes.indexOf(LF, after);
@@ -393,10 +410,17 @@ function multipartFields(bytes, boundary) {
                 headerEnd = position;
                 break;
             }
+            // Every line is checked as it is passed: a fold, or a token and a colon.
+            const problem = headerLineProblem(bytes, position, lineStop);
+            if (problem !== null) {
+                fields.malformed = problem;
+                return fields;
+            }
             position = lf + 1;
         }
         if (bodyStart === -1) {
-            continue;
+            fields.malformed = 'a part has no blank line after its headers';
+            return fields;
         }
 
         // The raw header block decides whether this is an email field, whatever
@@ -434,8 +458,12 @@ function multipartFields(bytes, boundary) {
             }
         }
         const isEmail = email || parsed.some((params) => has(params, 'encodedName') && isEmailFieldName(params.encodedName));
-        const first = parsed[0];
-        if (!isEmail && (has(first, 'filename') || has(first, 'filename*'))) {
+        // A filename with a value (or an empty one, `filename=""`) makes a
+        // file for PHP ($_FILES) and undici (File), whatever else the headers say.
+        const isFile = dispositions.some((line) => headerParameterList(line).some(
+            ([key, , , assigned]) => assigned && (key === 'filename' || key.startsWith('filename*'))
+        ));
+        if (isFile) {
             continue;
         }
         const nameOf = (params) => (has(params, 'name') ? params.name : params.encodedName);
@@ -455,7 +483,42 @@ function multipartFields(bytes, boundary) {
         });
     }
 
+    if (!closed && fields.malformed === null) {
+        fields.malformed = 'there is no closing delimiter';
+    }
     return fields;
+}
+
+/** Whether the byte may be in a header field name (an RFC 9110 token character). */
+function isTokenByte(byte) {
+    return (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a) ||
+        (byte > 0x20 && byte < 0x7f && "!#$%&'*+-.^_`|~".includes(String.fromCharCode(byte)));
+}
+
+/**
+ * Why the header line bytes[from, to) (line break excluded) is malformed, or
+ * null: it holds a NUL byte or a CR (the one before the LF is left out by the
+ * caller), or it is neither a fold (it starts with a space or tab) nor
+ * `Token: value`. One pass over the line.
+ */
+function headerLineProblem(bytes, from, to) {
+    for (let i = from; i < to; i++) {
+        if (bytes[i] === 0x00) {
+            return 'a part header holds a NUL byte';
+        }
+        if (bytes[i] === 0x0d) {
+            return 'a part header holds a bare CR';
+        }
+    }
+    if (bytes[from] === 0x20 || bytes[from] === 0x09) {
+        return null;
+    }
+    let i = from;
+    while (i < to && isTokenByte(bytes[i])) i++;
+    if (i === from || bytes[i] !== 0x3a) {
+        return 'a part header line is not "Name: value"';
+    }
+    return null;
 }
 
 /**
@@ -1119,7 +1182,8 @@ function apiErrorText(data, fallback = 'ZeroBounce returned no validation status
 /**
  * Whether a 2xx body is an API error even though it carries a status: a
  * real false success flag, or a non-empty error, error_message or Error
- * string. A real flag is a boolean, the number 0 or 1 (including 1.0), or
+ * member (a string with text, a number other than 0, true, a non-empty array
+ * or object). A real flag is a boolean, the number 0 or 1 (including 1.0), or
  * "true" / "false" / "0" / "1" in any case, trimmed. Anything else, including
  * "x" and 0.4, is not a flag. A validation result has neither.
  */
@@ -1145,9 +1209,16 @@ function isApiErrorBody(data) {
     if (isFalseSuccessFlag(data.success)) {
         return true;
     }
-    return ['error', 'error_message', 'Error'].some(
-        (key) => typeof data[key] === 'string' && data[key].trim() !== ''
-    );
+    return ['error', 'error_message', 'Error'].some((key) => isErrorMember(data[key]));
+}
+
+/** Whether an error member holds something: text, a number other than 0, true, or a non-empty array or object. */
+function isErrorMember(value) {
+    if (typeof value === 'string') return value.trim() !== '';
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'boolean') return value;
+    if (Array.isArray(value)) return value.length > 0;
+    return value !== null && typeof value === 'object' && Object.keys(value).length > 0;
 }
 
 /**
@@ -1324,7 +1395,17 @@ function listEntries(value) {
     if (!Array.isArray(items) || items.some((item) => typeof item !== 'string')) {
         return null;
     }
-    return items.map((item) => item.replace(LIST_JUNK, '').replace(/^[,;|\s]+|[,;|\s]+$/g, '')).filter((item) => item !== '');
+    return items.map((item) => trimSeparators(item.replace(LIST_JUNK, ''))).filter((item) => item !== '');
+}
+
+/** The text without leading and trailing commas, semicolons, pipes and white space (a loop, not a regex: linear). */
+function trimSeparators(text) {
+    const separator = (char) => char === ',' || char === ';' || char === '|' || /\s/.test(char);
+    let start = 0;
+    let end = text.length;
+    while (start < end && separator(text[start])) start++;
+    while (end > start && separator(text[end - 1])) end--;
+    return text.slice(start, end);
 }
 
 /**
@@ -1361,9 +1442,12 @@ function bindingList(name, value, lower = false) {
 
 /** Forwards the request with a new body, keeping its method, headers and URL. */
 async function forwardWithBody(request, body) {
+    // The incoming Content-Length describes the old body: the runtime sets the new one.
+    const headers = new Headers(request.headers);
+    headers.delete('content-length');
     const newRequest = new Request(
         request.url.toString(),
-        new Request(request, { body })
+        new Request(request, { body, headers })
     );
 
     logLine(`Returning modified request.`);
@@ -1447,6 +1531,12 @@ async function handleRequest(event) {
                 }
                 const _body = new Uint8Array(await request.clone().arrayBuffer());
                 const fields = boundary ? multipartFields(_body, boundary) : [];
+                if (fields.malformed) {
+                    // PHP and undici read bytes this parser would skip, so the
+                    // body cannot be read the way the origin will read it.
+                    errorLine(`Refusing a multipart body that is not well formed: ${fields.malformed}.`);
+                    return new Response('Bad Request', { status: 400, headers: { 'content-type': 'text/plain' } });
+                }
                 const chosen = chooseAddressField(fields);
                 let targets = [];
 
@@ -1483,11 +1573,11 @@ async function handleRequest(event) {
                 const _body = new Uint8Array(await request.clone().arrayBuffer());
                 const fields = formFields(_body);
 
-                // Method 1:
-                // The first field named exactly email, your-email or your_email whose value is an address.
-                // Method 2:
-                // Otherwise the first field whose value is an email address. This
-                // applies when the email input is not named accordingly (email).
+                // The first field named exactly email, your-email or your_email
+                // whose value is an address; else the first email field (its
+                // name contains "email") holding an address; else the first
+                // field of any name whose value is an address (the input is
+                // not named accordingly).
                 // ==========================================================
                 const chosen = chooseAddressField(fields);
 

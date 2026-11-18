@@ -121,19 +121,36 @@ use `BYPASS_PATH`, or name that field without the word `email`.
 
 **Multipart forms.** A part is an email field when its header block (all header lines, folded lines included) mentions
 `email`, whatever the `Content-Disposition` looks like. If there is no such part, the Worker takes the first text part
-whose whole value is an address. A file part (a part with any `filename` parameter, even an empty one) is not read, unless its headers
-mention `email`. Then it is treated like any email field: when `VALID_STATUS` is set, a value that holds `@` and is not the
-validated address is rewritten. A part with no
-`filename` is a text field, even when its `Content-Type` is binary. Only the value bytes are replaced; the whitespace
-around them stays.
+whose whole value is an address.
+
+A file part is a part whose `Content-Disposition` has a `filename` or `filename*` parameter with a value, even an empty
+one (`filename=""`). PHP (`$_FILES`) and other parsers treat it as a file, so the Worker never reads it and never changes
+it, even if its field name or file name mentions `email` (`filename="my-email.eml"`, `name="email_list"`) and even if its
+bytes hold `@`. A bare `filename` with no `=` is not a file: PHP puts it in `$_POST`, so it stays a text field, judged by
+the rest of its header block. A part with no `filename` is a text field, even when its `Content-Type` is binary. Only the
+value bytes of a text field are replaced; the whitespace around them stays.
+
+A multipart body must be well formed, or the Worker answers `400 Bad Request` (see the ambiguous cases below). It is
+malformed when:
+
+- a part's header block has a line that is neither `Name: value` (a token before the colon) nor a fold (a line that
+  starts with a space or tab), or it holds a NUL byte or a bare CR. A space before the colon (`Content-Disposition :`)
+  counts as malformed;
+- a part has headers but no blank line that ends them;
+- there is no closing delimiter `--boundary--`;
+- after the closing delimiter, the rest of the body holds `--boundary` again. Any other epilogue is allowed, such as the
+  `--boundary--` plus line break that browsers send.
+
+The Worker refuses these because PHP and other parsers read bytes the Worker would skip.
 
 A multipart email part with a `Content-Transfer-Encoding` other than `7bit`, `8bit` or `binary` (for example
 `quoted-printable` or `base64`) cannot be validated. When `VALID_STATUS` is set, the Worker rewrites its value to
 `INVALID`.
 
 The whole `Content-Type` is read, in any letter case. If it contains `multipart/form-data`, the body is multipart.
-Otherwise, if it contains `application/x-www-form-urlencoded`, it is URL-encoded. Otherwise the JSON branch applies, as
-before. A `Content-Type` that names both form types, or a form type with anything else before the first `;` (for
+Otherwise, if it contains `application/x-www-form-urlencoded`, it is URL-encoded. Otherwise the body is not a form, and
+only a media type of exactly `application/json` goes to the JSON branch. Every other type (`text/plain`, none at all, and
+so on) is forwarded untouched. A `Content-Type` that names both form types, or a form type with anything else before the first `;` (for
 example `multipart/form-data, x`, `multipart/form-data x` or `text/plain, multipart/form-data`), is ambiguous. So is any other
 `Content-Type` that mentions a form type, such as `text/plain; x=multipart/form-data`, and a multipart `Content-Type`
 that mentions `boundary` (as `boundary*=` or `xboundary=`) without a plain `boundary` parameter. Normal
@@ -219,7 +236,20 @@ These behaviours changed since commit dfb439c. Check them before you update an e
 - **Unknown `VALID_STATUS` entries** are ignored and logged.
 - **`API_TIMEOUT`** must be 1 to 600000; other values are logged and replaced by the default.
 - **`API_KEY`** must be printable ASCII (U+0021–U+007E).
-- **JSON branch.** Any key that contains `email` is an email field (before: any key that starts with `email`).
+- **JSON branch.** Any key that contains `email` is an email field (before: any key that starts with `email`). When
+  `VALID_STATUS` is set, an email key whose value is not a string is set to `"INVALID"`.
+- **Malformed multipart** (see above) is answered with `400 Bad Request`. Before, it was forwarded.
+- **A non-address `email` value** (`email=notanemail`) is no longer sent to the API. Before, the API answered `invalid`
+  and the value became `INVALID`. Now it is forwarded as is and costs no credit, unless it holds `@`: then it becomes
+  `INVALID` (see above).
+- **KV failure records** are one JSON object, `{"error": ..., "message": ...}`. Before, the value was a JSON string that
+  held JSON. Update any reader of `LOGS`.
+- **An unknown API status** now fails open and is logged. Before, it was rewritten to `INVALID`.
+- **Which field is validated.** The order is: the first field named exactly `email`, `your-email` or `your_email` that
+  holds an address; then the first email field that holds an address; then any field that holds an address. `your_email`
+  is new. Before, `contact=b@x.com&email2=a@x.com` validated `b@x.com`; now it validates `a@x.com`.
+- **File parts** in multipart forms are never read or changed. Before, a file part whose headers mentioned `email` and
+  whose bytes held `@` was replaced by `INVALID`.
 
 ## Development
 
