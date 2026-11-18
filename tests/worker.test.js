@@ -1384,12 +1384,12 @@ test('H1: only the value bytes are replaced; the whitespace around them stays', 
     assert.strictEqual(text, mpBody(field('email', '  \tINVALID \n ')));
 });
 
-test('H1: a filename (or filename*) with a value marks a file, whatever the part header mentions', async () => {
+test('H1: a plain filename with a value marks a file; filename* does not (PHP reads it as a text field)', async () => {
     const file = 'Content-Disposition: form-data; name="doc"; filename="x.txt"\r\n\r\nsomeone@x.com';
-    const star = 'Content-Disposition: form-data; name="doc2"; filename*=UTF-8\'\'a.txt\r\n\r\nsomeone@x.com';
+    const star = 'Content-Disposition: form-data; name="doc2"; filename*=UTF-8\'\'a.txt\r\n\r\nother@x.com';
+    assert.strictEqual((await runHandler(mpRequest(mpBody(file)))).calls.validation.length, 0);
     const { calls } = await runHandler(mpRequest(mpBody(file, star)));
-
-    assert.strictEqual(calls.validation.length, 0);
+    assert.deepStrictEqual(validated(calls), ['other@x.com']);
 
     // A filename that quotes name="email" is still a file: PHP and undici
     // keep it out of the form fields, so it is never read and never rewritten.
@@ -1997,11 +1997,18 @@ test('R2 bypass: a part named like an email field with a bare filename is a text
     assert.deepStrictEqual(validated(r.calls), ['g@ok.example']);
     assert.strictEqual(r.text, mpBody(field('email', 'g@ok.example'), disp('name="email"; filename', 'INVALID')));
     // A filename with a value, even an empty one, is a file: never read, never rewritten.
-    for (const extra of ['filename=""', 'filename="a.txt"', "filename*=UTF-8''a.txt", 'filename=a.txt', 'filename*0*=UTF-8\'\'a']) {
+    for (const extra of ['filename=""', 'filename="a.txt"', 'filename=a.txt', 'FILENAME="a"']) {
         const body = mpBody(field('email', 'g@ok.example'), disp(`name="email"; ${extra}`, 'e@bad.example'));
         const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
         assert.deepStrictEqual(validated(calls), ['g@ok.example'], extra);
         assert.strictEqual(text, body, extra);
+    }
+    // filename*=, filename*0*= and a blank before "=" are text fields to PHP: rewritten like any email field.
+    for (const extra of ["filename*=UTF-8''a.txt", "filename*0*=UTF-8''a", 'filename*=', 'filename ="a"', 'filename\t="a"']) {
+        const body = mpBody(field('email', 'g@ok.example'), disp(`name="email"; ${extra}`, 'e@bad.example'));
+        const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+        assert.deepStrictEqual(validated(calls), ['g@ok.example'], extra);
+        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), disp(`name="email"; ${extra}`, 'INVALID')), extra);
     }
     // Alone, such a part is not validated.
     const alone = mpBody(disp('name="email"; filename="a.txt"', 'a@x.com'));
@@ -2016,20 +2023,15 @@ test('R2 bypass: a part named like an email field with a bare filename is a text
     assert.deepStrictEqual(validated((await runHandler(mpRequest(bareOther), { status: 'valid' })).calls), ['a@x.com']);
 });
 
-test('R2 bypass: a part with two Content-Disposition headers is a candidate if any names a candidate', async () => {
+test('R2 bypass: a part with two Content-Disposition headers is malformed (PHP reads the first, undici the last)', async () => {
     const twice = (a, b, value) => `Content-Disposition: form-data; ${a}\r\nContent-Disposition: form-data; ${b}\r\n\r\n${value}`;
-    for (const [a, b] of [['name="note"', 'name="email"'], ['name="email"', 'name="note"'], ['name="note"; filename', 'name="your.email"']]) {
+    for (const [a, b] of [['name="note"', 'name="email"'], ['name="email"', 'name="note"'], ['name="email"; filename="a"', 'name="email"'], ['name="email"', 'name="email"; filename="a"']]) {
         const body = mpBody(field('email', 'g@ok.example'), twice(a, b, 'e@bad.example'));
-        const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
-        assert.deepStrictEqual(validated(calls), ['g@ok.example'], `${a} ${b}`);
-        assert.strictEqual(text, mpBody(field('email', 'g@ok.example'), twice(a, b, 'INVALID')), `${a} ${b}`);
-    }
-    // A filename value in any of the headers makes a file: never read, never rewritten.
-    for (const [a, b] of [['name="note"; filename="a"', 'name="other"'], ['name="note"', 'name="doc"; filename="a"'], ['name="email"; filename=""', 'name="email"']]) {
-        const file = mpBody(field('email', 'g@ok.example'), twice(a, b, 'a@x.com'));
-        const result = await runHandler(mpRequest(file), { status: 'valid' });
-        assert.deepStrictEqual(validated(result.calls), ['g@ok.example'], `${a} ${b}`);
-        assert.strictEqual(result.text, file, `${a} ${b}`);
+        const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+        const response = await worker.context.handleRequest(fetchEvent(mpRequest(body)));
+        assert.strictEqual(response.status, 400, `${a} ${b}`);
+        assert.strictEqual(worker.calls.forwarded.length, 0);
+        assert.strictEqual(worker.calls.validation.length, 0);
     }
 });
 
@@ -3100,13 +3102,10 @@ test('R4-5: folded Content-Disposition lines are joined', async () => {
     assert.deepStrictEqual(validated(t.calls), ['bad@x.com']);
 });
 
-test('R4-5: among repeated Content-Disposition headers the exact email name is preferred', async () => {
+test('R4-5: repeated Content-Disposition headers make the body malformed', async () => {
     const { context } = loadWorker({ API_KEY });
-    const bytes = new TextEncoder().encode(rawMp('B', 'Content-Disposition: form-data; name="x_email"\r\nContent-Disposition: form-data; name="email"\r\n\r\nv@x.com', 'Content-Disposition: form-data; name="a"\r\nContent-Disposition: form-data; name="b"\r\n\r\nw'));
-    const fields = context.multipartFields(bytes, 'B');
-    assert.deepStrictEqual(Array.from(fields, (f) => f.name), ['email', 'a']);
-    assert.strictEqual(fields[0].email, true);
-    assert.strictEqual(fields[1].email, false);
+    const bytes = new TextEncoder().encode(rawMp('B', 'Content-Disposition: form-data; name="x_email"\r\nContent-Disposition: form-data; name="email"\r\n\r\nv@x.com'));
+    assert.match(context.multipartFields(bytes, 'B').malformed, /more than one Content-Disposition/);
 });
 
 test('R4-5: the fallback rewrites repeats of the chosen name that are not empty, and only those', async () => {
@@ -3153,7 +3152,7 @@ test('round 5: file parts reach the origin byte for byte, whatever their headers
         ['Content-Disposition: form-data; name="doc"; filename="my-email.eml"\r\nContent-Type: message/rfc822\r\n\r\n', enc.encode('From: someone@bad.example\r\n\r\nhi')],
         ['Content-Disposition: form-data; name="email_list"; filename="list.csv"\r\nContent-Type: text/csv\r\n\r\n', enc.encode('a@bad.example,b@bad.example\n')],
         ['Content-Disposition: form-data; name="email"; filename=""\r\n\r\n', enc.encode('c@bad.example')],
-        ['Content-Disposition: form-data; name="x"; filename*=UTF-8\'\'email.txt\r\n\r\n', enc.encode('d@bad.example')],
+        ['Content-Disposition: form-data; name="x"; filename="email.txt"\r\n\r\n', enc.encode('d@bad.example')],
         ['Content-Disposition: form-data; name="img"; filename="e.png"\r\nContent-Type: image/png\r\nX-Note: email\r\n\r\n', png],
     ];
     const chunks = [enc.encode('--zb-b\r\nContent-Disposition: form-data; name="email"\r\n\r\ng@ok.example\r\n')];

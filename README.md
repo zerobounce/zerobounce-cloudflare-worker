@@ -123,11 +123,12 @@ use `BYPASS_PATH`, or name that field without the word `email`.
 `email`, whatever the `Content-Disposition` looks like. If there is no such part, the Worker takes the first text part
 whose whole value is an address.
 
-A file part is a part whose `Content-Disposition` has a `filename` or `filename*` parameter with a value, even an empty
-one (`filename=""`). PHP (`$_FILES`) and other parsers treat it as a file, so the Worker never reads it and never changes
+A file part is a part whose `Content-Disposition` has a plain `filename=` parameter with a value, even an empty one
+(`filename=""`). PHP (`$_FILES`) and other parsers treat it as a file, so the Worker never reads it and never changes
 it, even if its field name or file name mentions `email` (`filename="my-email.eml"`, `name="email_list"`) and even if its
-bytes hold `@`. A bare `filename` with no `=` is not a file: PHP puts it in `$_POST`, so it stays a text field, judged by
-the rest of its header block. A part with no `filename` is a text field, even when its `Content-Type` is binary. Only the
+bytes hold `@`. A bare `filename` with no `=`, a `filename*=` parameter, or a blank before the `=` (`filename ="a"`) is not a
+file: PHP puts such a part in `$_POST`, so it stays a text field, judged by the rest of its header block. A part with
+more than one `Content-Disposition` header is malformed (`400 Bad Request`): PHP reads the first and undici the last. A part with no `filename` is a text field, even when its `Content-Type` is binary. Only the
 value bytes of a text field are replaced; the whitespace around them stays.
 
 A multipart body must be well formed, or the Worker answers `400 Bad Request` (see the ambiguous cases below). It is

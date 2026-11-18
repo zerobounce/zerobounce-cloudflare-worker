@@ -81,7 +81,7 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   `replaceFieldValues` swaps only the rejected value. Every other byte must reach the origin as sent.
 - **Multipart bodies are never decoded as a whole either.** `multipartFields` splits the raw body on its boundary
   and reads the headers and value of each part as a one-character-per-byte string, so offsets are byte offsets. File
-  parts (a `filename=` or `filename*=` value, even empty) are never read or changed; a bare `filename` is a text field. `chooseAddressField` picks the address and
+  parts (a plain `filename=` value, even empty, in the part's only Content-Disposition) are never read or changed; a bare `filename`, `filename*=` or `filename =` is a text field, as PHP reads it. `chooseAddressField` picks the address and
   `fieldsToRewrite` lists the fields to change; `replaceFieldValues` then swaps only those values. A UTF-8 decode and re-encode of
   the body would replace every non-UTF-8 byte of an uploaded file with U+FFFD.
 - **Content types are compared by media type** (`mediaType`: lower case, parameters dropped) wherever the JSON branch

@@ -238,9 +238,9 @@ function indexOfBytes(bytes, pattern, from = 0, to = bytes.length) {
 
 /**
  * The parameters of a header value (the text after the first ";") as a list of
- * [name, value, quoted, assigned] in order, names in lower case (quoted: the
- * value was a quoted string; assigned: the parameter has an "=", even with an
- * empty value): a linear scan that honours
+ * [name, value, quoted, assigned, plain] in order, names in lower case (quoted:
+ * the value was a quoted string; assigned: the parameter has an "=", even with
+ * an empty value; plain: no blank between the name and the "="): a linear scan that honours
  * quoted strings (with backslash escapes), so a filename that merely contains
  * `name="email"` does not set the field name.
  */
@@ -252,7 +252,8 @@ function headerParameterList(text) {
         while (i < text.length && /[ \t]/.test(text[i])) i++;
         const nameStart = i;
         while (i < text.length && text[i] !== '=' && text[i] !== ';') i++;
-        const paramName = text.slice(nameStart, i).trim().toLowerCase();
+        const rawParamName = text.slice(nameStart, i);
+        const paramName = rawParamName.trim().toLowerCase();
         let value = '';
         let quoted = false;
         const assigned = text[i] === '=';
@@ -276,7 +277,7 @@ function headerParameterList(text) {
             }
         }
         if (paramName) {
-            params.push([paramName, value, quoted, assigned]);
+            params.push([paramName, value, quoted, assigned, rawParamName.toLowerCase() === paramName]);
         }
     }
     return params;
@@ -445,6 +446,12 @@ function multipartFields(bytes, boundary) {
         if (dispositions.length === 0) {
             continue;
         }
+        if (dispositions.length > 1) {
+            // PHP reads the first Content-Disposition and undici the last: the
+            // part means different things to different origins.
+            fields.malformed = 'a part has more than one Content-Disposition header';
+            return fields;
+        }
 
         const parsed = dispositions.map(headerParameters);
         const has = (params, key) => Object.prototype.hasOwnProperty.call(params, key);
@@ -458,11 +465,13 @@ function multipartFields(bytes, boundary) {
             }
         }
         const isEmail = email || parsed.some((params) => has(params, 'encodedName') && isEmailFieldName(params.encodedName));
-        // A filename with a value (or an empty one, `filename=""`) makes a
-        // file for PHP ($_FILES) and undici (File), whatever else the headers say.
-        const isFile = dispositions.some((line) => headerParameterList(line).some(
-            ([key, , , assigned]) => assigned && (key === 'filename' || key.startsWith('filename*'))
-        ));
+        // Only a plain `filename=` parameter (a value, even an empty one) makes a
+        // file for PHP ($_FILES) as well as undici (File). PHP reads `filename*=`,
+        // `filename =` and `filename\t=` parts as text fields ($_POST), so those
+        // are judged like any text field.
+        const isFile = headerParameterList(dispositions[0]).some(
+            ([key, , , assigned, plain]) => assigned && plain && key === 'filename'
+        );
         if (isFile) {
             continue;
         }
