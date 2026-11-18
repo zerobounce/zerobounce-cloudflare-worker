@@ -174,12 +174,13 @@ test('the API key travels as the api_key query parameter, never as a header', as
     }
 });
 
-test('no validation request is made when API_KEY is not bound', async () => {
-    const { context, calls } = loadWorker({});
+test('no validation request is made when API_KEY is not bound, and the failure is returned, not thrown', async () => {
+    const { context, calls, errors } = loadWorker({});
 
     const result = await context.validateEmail('test@example.com', '198.51.100.7');
 
-    assert.strictEqual(result, undefined);
+    assert.strictEqual(JSON.parse(result).error, 'Missing API_KEY');
+    assert.ok(errors.some((line) => line.includes('API_KEY')));
     assert.strictEqual(calls.validation.length, 0);
 });
 
@@ -479,7 +480,6 @@ test('the documented validate examples, with their null and empty fields, are st
             region: 'Florida', city: 'West Palm Beach', zipcode: '33401', processed_at: '2023-03-23 13:30:28.105',
         },
         { address: 'invalid@example.com', status: 'invalid', sub_status: 'failed_syntax_check', account: '', mx_record: null },
-        { address: 'a@example.com', status: 'a_status_added_later' },
     ]) {
         const { context } = loadWorker({ API_KEY }, { validationResponse: body });
         const result = await context.validateEmail('test@example.com', '198.51.100.7');
@@ -924,7 +924,9 @@ for (const mode of FAILURE_MODES) {
 
         // What is stored in KV is the failure payload, not the API's raw body.
         assert.strictEqual(kv.puts.length, 1);
-        const stored = JSON.parse(JSON.parse(kv.puts[0].value));
+        // One JSON object text, not a JSON string holding JSON.
+        const stored = JSON.parse(kv.puts[0].value);
+        assert.strictEqual(typeof stored, 'object');
         assert.deepStrictEqual(Object.keys(stored).sort(), ['error', 'message']);
 
         const encoded = encodeURIComponent(KEY_WITH_ENCODING);
@@ -1281,4 +1283,580 @@ test('the decode check covers four layers: the request encoding plus three echo 
     assertHeld(key, echo);
     const json = (text) => JSON.stringify(text).slice(1, -1);
     assertHeld(key, encodeURIComponent(json(encodeURIComponent(json(key)))));
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 1: multipart parsing (H1), repeated fields (M1), key check (M2),
+// missing key (M3), status (M4), entities (M5), U+0307 (M6) and the Lows
+// ---------------------------------------------------------------------------
+
+/** A POST through the handler; the validation answers with `status`. Returns what reached the origin and the stubs. */
+async function runHandler(request, { bindings = {}, status = 'invalid', kv = null } = {}) {
+    const worker = loadWorker(
+        { API_KEY, VALID_STATUS: ['valid'], ...(kv ? { LOGS: kv.LOGS } : {}), ...bindings },
+        { validationResponse: { address: 'test@example.com', status } }
+    );
+    await worker.context.handleRequest(fetchEvent(request));
+    const forwarded = worker.calls.forwarded[0];
+    const body = new Uint8Array(await forwarded.arrayBuffer());
+    return { ...worker, body, text: new TextDecoder().decode(body) };
+}
+
+const MP = 'zb-b';
+function mpBody(...parts) {
+    return parts.map((part) => `--${MP}\r\n${part}\r\n`).join('') + `--${MP}--\r\n`;
+}
+function mpRequest(body) {
+    return multipartRequest(body, `multipart/form-data; boundary=${MP}`);
+}
+const field = (name, value, extraHeaders = '') => `Content-Disposition: form-data; name="${name}"\r\n${extraHeaders}\r\n${value}`;
+
+test('H1: a text part of 64 KiB of n, r or backslash is scanned in linear time and no address is invented', async () => {
+    for (const filler of ['n', 'r', '\\', 'nr\\\\']) {
+        const body = mpBody(field('message', filler.repeat(65536 / filler.length)), field('tail', 'anna@x.com junk'));
+        const started = Date.now();
+        const { calls, text } = await runHandler(mpRequest(body));
+        const elapsed = Date.now() - started;
+
+        assert.ok(elapsed < 2000, `took ${elapsed} ms for ${JSON.stringify(filler)}`);
+        assert.strictEqual(calls.validation.length, 0);
+        assert.strictEqual(text, body);
+    }
+});
+
+test('H1: an address after extra part headers is read whole, not from its second letter', async () => {
+    const body = mpBody(field('contact', 'anna@x.com', 'Content-Type: text/plain\r\nX-Note: n\r\n'));
+    const { calls, text } = await runHandler(mpRequest(body));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'anna@x.com');
+    assert.strictEqual(text, mpBody(field('contact', 'INVALID', 'Content-Type: text/plain\r\nX-Note: n\r\n')));
+});
+
+test('H1: a part with its own Content-Type text/plain is still a text field', async () => {
+    const body = mpBody(field('email', 'a.b@x.com', 'Content-Type: text/plain; charset=utf-8\r\n'));
+    const { calls } = await runHandler(mpRequest(body), { status: 'valid' });
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'a.b@x.com');
+});
+
+test('H1: the field name may be quoted or a token, in any case of the parameter, with bare LF line breaks', async () => {
+    for (const disposition of ['form-data; name=email', 'form-data; NAME="email"', 'FORM-DATA;name = "email"', 'form-data; name="email"; x=1']) {
+        const body = `--${MP}\ncontent-disposition: ${disposition}\n\nperson@x.com\n--${MP}--\n`;
+        const { calls, text } = await runHandler(mpRequest(body));
+
+        assert.strictEqual(calls.validation.length, 1, disposition);
+        assert.strictEqual(text, `--${MP}\ncontent-disposition: ${disposition}\n\nINVALID\n--${MP}--\n`, disposition);
+    }
+});
+
+test('H1: a part named email wins over an earlier text part that holds an address', async () => {
+    const body = mpBody(field('contact', 'first@x.com'), field('email', 'second@x.com'));
+    const { calls, text } = await runHandler(mpRequest(body), { status: 'valid' });
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'second@x.com');
+    assert.strictEqual(text, body);
+});
+
+test('H1: without a named part, the first text part whose whole value is an address is used; an address inside prose is not', async () => {
+    const body = mpBody(field('note', 'write to me at prose@x.com please'), field('who', 'whole@x.com'));
+    const { calls } = await runHandler(mpRequest(body), { status: 'valid' });
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'whole@x.com');
+});
+
+test('H1: a value longer than 320 characters is never an address', async () => {
+    const body = mpBody(field('who', `${'a'.repeat(400)}@x.com`));
+    const { calls } = await runHandler(mpRequest(body));
+
+    assert.strictEqual(calls.validation.length, 0);
+});
+
+test('H1: only the value bytes are replaced; the whitespace around them stays', async () => {
+    const body = mpBody(field('email', '  \tperson@x.com \n '));
+    const { calls, text } = await runHandler(mpRequest(body));
+
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'person@x.com');
+    assert.strictEqual(text, mpBody(field('email', '  \tINVALID \n ')));
+});
+
+test('H1: a filename (or filename*) marks a file; a filename that quotes name="email" does not rename the part', async () => {
+    const file = 'Content-Disposition: form-data; name="doc"; filename="name=\\"email\\"; x.txt"\r\n\r\nsomeone@x.com';
+    const star = 'Content-Disposition: form-data; name="email"; filename*=UTF-8\'\'a.txt\r\n\r\nsomeone@x.com';
+    const { calls } = await runHandler(mpRequest(mpBody(file, star)));
+
+    assert.strictEqual(calls.validation.length, 0);
+
+    // The quoted filename is not the field name: the part is named "doc" and is a file.
+    const text = mpBody('Content-Disposition: form-data; name="x"; filename="a; name=email"\r\n\r\nsomeone@x.com');
+    assert.strictEqual((await runHandler(mpRequest(text))).calls.validation.length, 0);
+});
+
+test('H1: a text part whose name hides in a quoted parameter value is read by its real name', async () => {
+    const body = mpBody('Content-Disposition: form-data; x="; name=email"; name="note"\r\n\r\nperson@x.com');
+    const { calls } = await runHandler(mpRequest(body), { status: 'valid' });
+
+    assert.strictEqual(calls.validation.length, 1);
+});
+
+// --- M1 ---------------------------------------------------------------------
+
+test('M1: repeated and alias fields cost one validation; every other candidate value that differs becomes INVALID, whatever the status', async () => {
+    const cases = [
+        ['email=a%40x.com&email=b%40x.com', 'email=a%40x.com&email=INVALID'],
+        ['email=a%40x.com&your-email=b%40x.com', 'email=a%40x.com&your-email=INVALID'],
+        ['your-email=b%40x.com&email=a%40x.com&email=a%40x.com', 'your-email=INVALID&email=a%40x.com&email=a%40x.com'],
+        ['email=junk&email=a%40x.com', 'email=INVALID&email=a%40x.com'],
+        ['email=a%40x.com&email=&n=1', 'email=a%40x.com&email=&n=1'],
+        ['contact=a%40x.com&contact=b%40x.com&email2=c%40x.com', 'contact=a%40x.com&contact=INVALID&email2=c%40x.com'],
+    ];
+    for (const [sent, expected] of cases) {
+        const { calls, text } = await runHandler(formRequest(sent), { status: 'valid' });
+        assert.strictEqual(calls.validation.length, 1, sent);
+        assert.strictEqual(text, expected, sent);
+    }
+});
+
+test('M1: a rejected address rewrites every candidate value, repeats and aliases included', async () => {
+    const { calls, text } = await runHandler(formRequest('email=a%40x.com&n=1&your-email=b%40x.com&email=c%40x.com'));
+
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(text, 'email=INVALID&n=1&your-email=INVALID&email=INVALID');
+});
+
+test('M1: a fail-open validation leaves repeated fields untouched, and so does an unset VALID_STATUS', async () => {
+    const sent = 'email=a%40x.com&email=b%40x.com';
+    const failing = loadWorker({ API_KEY: 'bad key', VALID_STATUS: ['valid'] });
+    await failing.context.handleRequest(fetchEvent(formRequest(sent)));
+    assert.strictEqual(await failing.calls.forwarded[0].text(), sent);
+
+    const open = await runHandler(formRequest(sent), { bindings: { VALID_STATUS: undefined } });
+    assert.strictEqual(open.text, sent);
+});
+
+test('M1: a leading ? is part of the field name; ?email is not email', async () => {
+    const { calls, text } = await runHandler(formRequest('%3Femail=zz%40x.com&?email=a%40x.com&email=b%40x.com'), { status: 'valid' });
+
+    assert.strictEqual(calls.validation[0].url.searchParams.get('email'), 'b%40x.com'.replace('%40', '@'));
+    assert.strictEqual(text, '%3Femail=zz%40x.com&?email=a%40x.com&email=b%40x.com');
+
+    const only = await runHandler(formRequest('?email=a%40x.com'), { status: 'valid' });
+    // Found as the first field holding an address, not as "email".
+    assert.strictEqual(only.calls.validation.length, 1);
+    assert.ok(only.logs.some((line) => line.startsWith('Matched email')));
+});
+
+test('M1: repeated multipart fields follow the same rule', async () => {
+    const body = mpBody(field('email', 'a@x.com'), field('your-email', 'b@x.com'), field('email', 'c@x.com'));
+    const valid = await runHandler(mpRequest(body), { status: 'valid' });
+    assert.strictEqual(valid.calls.validation.length, 1);
+    assert.strictEqual(valid.text, mpBody(field('email', 'a@x.com'), field('your-email', 'INVALID'), field('email', 'INVALID')));
+
+    const rejected = await runHandler(mpRequest(body));
+    assert.strictEqual(rejected.text, mpBody(field('email', 'INVALID'), field('your-email', 'INVALID'), field('email', 'INVALID')));
+});
+
+test('M1: JSON email and your-email keys follow the same rule', async () => {
+    const make = (form) => new Request('https://example.com/f', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ form: JSON.stringify(form), other: 1 }),
+    });
+    const valid = await runHandler(make({ email: 'a@x.com', 'your-email': 'b@x.com' }), { status: 'valid' });
+    assert.strictEqual(valid.calls.validation.length, 1);
+    assert.deepStrictEqual(JSON.parse(JSON.parse(valid.text).form), { email: 'a@x.com', 'your-email': 'INVALID' });
+
+    const rejected = await runHandler(make({ email: 'a@x.com', 'your-email': 'b@x.com' }));
+    assert.deepStrictEqual(JSON.parse(JSON.parse(rejected.text).form), { email: 'INVALID', 'your-email': 'INVALID' });
+});
+
+// --- M2 ---------------------------------------------------------------------
+
+const AUDITOR_KEY_CHARS = [
+    0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
+    0x2067, 0x2068, 0x2069, 0x061c, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0xfffa, 0xfffb,
+    0x1d174, 0x1d17a, 0xe0001, 0xe0020, 0xe007f, 0x034f, 0x115f, 0x3164, 0xffa0, 0x17b4,
+    // The lesson 135 list and the usual whitespace.
+    0x00ad, 0x0600, 0x0890, 0x0891, 0x180b, 0x180f, 0x200b, 0x202e, 0x2066, 0xfff9, 0x1d173, 0xfeff, 0x00a0, 0x2028, 0x2029, 0x3000, 0x0085,
+    0xe000, 0xf8ff, 0xd800, 0xdfff, 0x0378, 0x00e9, 0x4e2d,
+];
+
+test('M2: a key with any character outside printable ASCII is refused, and no request is made', async () => {
+    for (const code of AUDITOR_KEY_CHARS) {
+        const char = String.fromCodePoint(code);
+        for (const key of [`${API_KEY}${char}`, `${char}${API_KEY}`, `zb-dummy${char}key`]) {
+            const { context, calls, errors } = loadWorker({ API_KEY: key, VALID_STATUS: ['valid'] });
+            await context.handleRequest(fetchEvent(formRequest('email=test%40example.com')));
+            assert.strictEqual(calls.validation.length, 0, `U+${code.toString(16)} in ${JSON.stringify(key)}`);
+            assert.ok(errors.some((line) => line.includes('API_KEY')));
+        }
+    }
+});
+
+test('M2: printable ASCII keys, every symbol included, are accepted', async () => {
+    const all = Array.from({ length: 0x7e - 0x21 + 1 }, (_, i) => String.fromCharCode(0x21 + i)).join('');
+    for (const key of [API_KEY, all, '!', '~']) {
+        const { context, calls } = loadWorker({ API_KEY: key });
+        await context.validateEmail('test@example.com', null);
+        assert.strictEqual(calls.validation.length, 1, key);
+    }
+});
+
+// --- M3 ---------------------------------------------------------------------
+
+test('M3: a handler request without an API_KEY fails open with a log and a KV failure record, and does not throw', async () => {
+    for (const unset of [{ unbind: ['API_KEY'] }, { bindings: { API_KEY: null } }]) {
+        const kv = recordingKv();
+        const worker = loadWorker({ VALID_STATUS: ['valid'], LOGS: kv.LOGS, ...(unset.bindings || {}) }, { unbind: unset.unbind || [] });
+        const sent = 'email=test%40example.com&name=Test';
+
+        await worker.context.handleRequest(fetchEvent(formRequest(sent)));
+
+        assert.strictEqual(worker.calls.validation.length, 0);
+        assert.strictEqual(await worker.calls.forwarded[0].text(), sent);
+        assert.ok(worker.errors.some((line) => line.includes('API_KEY is not set')), JSON.stringify(worker.errors));
+        assert.strictEqual(kv.puts.length, 1);
+        assert.strictEqual(JSON.parse(kv.puts[0].value).error, 'Missing API_KEY');
+    }
+});
+
+test('M3: a missing API_KEY fails open on multipart and JSON bodies too', async () => {
+    const json = new Request('https://example.com/f', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ form: JSON.stringify({ email: 'a@x.com' }) }),
+    });
+    for (const request of [mpRequest(mpBody(field('email', 'a@x.com'))), json]) {
+        const worker = loadWorker({ VALID_STATUS: ['valid'] }, { unbind: ['API_KEY'] });
+        const sent = await request.clone().text();
+        await worker.context.handleRequest(fetchEvent(request));
+        assert.strictEqual(await worker.calls.forwarded[0].text(), sent);
+        assert.ok(worker.errors.some((line) => line.includes('API_KEY is not set')));
+    }
+});
+
+// --- M4 ---------------------------------------------------------------------
+
+test('M4: a 2xx status that is not a documented status is a failure; the text is not logged', async () => {
+    for (const status of ['x', 'a_status_added_later', '', `echo ${API_KEY}`, 'validx']) {
+        const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'test@example.com', status } });
+        const sent = 'email=test%40example.com';
+        await worker.context.handleRequest(fetchEvent(formRequest(sent)));
+
+        assert.strictEqual(await worker.calls.forwarded[0].text(), sent, JSON.stringify(status));
+        assert.ok(worker.errors.some((line) => line.startsWith('ZeroBounce validation failed')), JSON.stringify(status));
+        for (const line of [...worker.logs, ...worker.errors]) {
+            assert.ok(!line.includes(API_KEY), line);
+            assert.ok(!line.includes('a_status_added_later'), line);
+        }
+    }
+});
+
+test('M4: every documented status is accepted, trimmed and in any case', async () => {
+    for (const status of ['valid', 'invalid', 'catch-all', 'unknown', 'spamtrap', 'abuse', 'do_not_mail', ' Valid ', 'CATCH-ALL']) {
+        const { context } = loadWorker({ API_KEY }, { validationResponse: { address: 'test@example.com', status } });
+        const result = await context.validateEmail('test@example.com', null);
+        assert.strictEqual(result.status, status.trim().toLowerCase(), status);
+    }
+});
+
+test('M4: the status is judged against VALID_STATUS after normalising its case', async () => {
+    const { calls, text } = await runHandler(formRequest('email=a%40x.com'), { status: ' VALID ' });
+    assert.strictEqual(calls.validation.length, 1);
+    assert.strictEqual(text, 'email=a%40x.com');
+});
+
+// --- M5 ---------------------------------------------------------------------
+
+test('M5: the key spelled with HTML entities is masked, in numeric and named spellings, over up to four layers', () => {
+    const KEY = 'zb-dummy-key-ab_c';
+    const { context } = loadWorker({ API_KEY: KEY });
+    const spellings = [
+        'zb-dummy-key-&#97;b_c', 'zb-dummy-key-&#x61;b_c', 'zb-dummy-key-&#X61;b_c', 'zb-dummy-key-&#0000097;b_c',
+        'zb-dummy-key-&#97b_c', 'zb-dummy-key-&#x0061b_c'.replace('b_c', ';b_c'), 'zb-dummy-key-a&#98;_c', 'zb-dummy-key-ab&lowbar;c',
+        'zb-dummy-key-ab&LOWBAR;c', 'zb-dummy-key-ab&#95c', '&#122;&#98;-dummy-key-ab_c', 'zb&hyphen;dummy&dash;key-ab_c'.replace('&dash;', '-'),
+        'zb-dummy-key-&amp;#97;b_c', 'zb-dummy-key-&amp;amp;#97;b_c', 'zb-dummy-key-%26%2397%3Bb_c', 'zb-dummy-key-&#37;61b_c',
+    ];
+    for (const spelling of spellings) {
+        assert.strictEqual(context.redactKey(`echo ${spelling} end`), 'the response text was omitted because it contained a credential', spelling);
+    }
+});
+
+test('M5: an entity-looking text that does not spell the key is left alone', () => {
+    const { context } = loadWorker({ API_KEY });
+    const text = 'fish &amp; chips &#9999999999; &unknown; &#; & &lt;b&gt;';
+    assert.strictEqual(context.redactKey(text), text);
+});
+
+test('M5: entity decoding of a 1 MiB body of ampersands finishes in linear time', () => {
+    const { context } = loadWorker({ API_KEY });
+    for (const unit of ['&', '&#', '&amp;', '&#x']) {
+        const body = unit.repeat(Math.ceil((1 << 20) / unit.length));
+        const started = Date.now();
+        context.redactKey(body);
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed < 20000, `${JSON.stringify(unit)} took ${elapsed} ms`);
+    }
+});
+
+// --- M6 ---------------------------------------------------------------------
+
+test('M6: U+0130 in the key, echoed as a plain I, is masked (the dot above is dropped after i)', () => {
+    const { context } = loadWorker({ API_KEY: 'zb-dummy-key-\u0130x' });
+
+    assert.strictEqual(context.redactKey('echo zb-dummy-key-Ix end'), 'the response text was omitted because it contained a credential');
+    assert.strictEqual(context.redactKey('echo zb-dummy-key-ix end'), 'the response text was omitted because it contained a credential');
+    assert.strictEqual(context.redactKey('echo zb-dummy-key-jx end'), 'echo zb-dummy-key-jx end');
+});
+
+// --- Lows --------------------------------------------------------------------
+
+test('Low: an error whose name quotes the key is redacted in the log and in the payload', async () => {
+    const { context, errors } = loadWorker({ API_KEY });
+    context.fetch = async () => {
+        const error = new Error('down');
+        error.name = `Failed ${API_KEY}`;
+        throw error;
+    };
+    const result = await context.validateEmail('test@example.com', null);
+
+    assert.ok(!result.includes(API_KEY));
+    for (const line of errors) assert.ok(!line.includes(API_KEY), line);
+});
+
+test('Low: only the exact JSON keys email and your-email are read', async () => {
+    const make = (form) => new Request('https://example.com/f', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ form: JSON.stringify(form) }),
+    });
+    for (const form of [{ email_password: 'hunter2secret' }, { emailConfirm: 'a@x.com' }, { Email: 'a@x.com' }]) {
+        const worker = await runHandler(make(form));
+        assert.strictEqual(worker.calls.validation.length, 0, JSON.stringify(form));
+        for (const line of worker.logs) assert.ok(!line.includes('hunter2secret'), line);
+    }
+    const ok = await runHandler(make({ email_password: 'x', 'your-email': 'a@x.com' }));
+    assert.strictEqual(ok.calls.validation.length, 1);
+    assert.deepStrictEqual(JSON.parse(JSON.parse(ok.text).form), { email_password: 'x', 'your-email': 'INVALID' });
+});
+
+test('Low: a JSON body that does not parse, or whose form is not JSON, is forwarded untouched', async () => {
+    for (const body of ['{oops', JSON.stringify({ form: '{oops' }), JSON.stringify({ form: 5 }), 'null', JSON.stringify({ form: '[1]' })]) {
+        const request = new Request('https://example.com/f', { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+        const worker = await runHandler(request);
+        assert.strictEqual(worker.calls.validation.length, 0, body);
+        assert.strictEqual(worker.text, body);
+    }
+});
+
+test('Low: a url-encoded email field that is not an address is neither sent nor logged', async () => {
+    const worker = await runHandler(formRequest('email=hunter2secret&name=x'));
+
+    assert.strictEqual(worker.calls.validation.length, 0);
+    assert.strictEqual(worker.text, 'email=hunter2secret&name=x');
+    for (const line of worker.logs) assert.ok(!line.includes('hunter2secret'), line);
+
+    // ... and the search falls back as if the field were absent.
+    const fallback = await runHandler(formRequest('email=hunter2secret&contact=a%40x.com'), { status: 'valid' });
+    assert.strictEqual(fallback.calls.validation[0].url.searchParams.get('email'), 'a@x.com');
+});
+
+test('Low: VALID_STATUS and BYPASS_PATH bound as text: a JSON array, or one plain entry', async () => {
+    const sent = 'email=a%40x.com';
+    for (const [VALID_STATUS, status, rewritten] of [
+        ['["valid","catch-all"]', 'catch-all', false],
+        ['valid', 'valid', false],
+        ['valid', 'invalid', true],
+        ['  ["valid"]  ', 'invalid', true],
+        ['[valid', 'valid', true], // not JSON: one entry "[valid"
+    ]) {
+        const { text } = await runHandler(formRequest(sent), { bindings: { VALID_STATUS }, status });
+        assert.strictEqual(text, rewritten ? 'email=INVALID' : sent, `${VALID_STATUS} ${status}`);
+    }
+
+    for (const [BYPASS_PATH, bypassed] of [
+        ['/subscribe', true],
+        ['["/other", "/subscribe"]', true],
+        ['/', false],
+        ['/sub', false],
+        ['/subscribe/', false],
+        [['/subscribe'], true],
+        ['', false],
+    ]) {
+        const { calls } = await runHandler(formRequest(sent), { bindings: { BYPASS_PATH } });
+        assert.strictEqual(calls.validation.length, bypassed ? 0 : 1, JSON.stringify(BYPASS_PATH));
+    }
+});
+
+test('Low: a malformed VALID_STATUS or BYPASS_PATH is logged once per request and then ignored', async () => {
+    for (const bad of [42, { a: 1 }, [1, 2], true]) {
+        const worker = loadWorker({ API_KEY, VALID_STATUS: bad, BYPASS_PATH: bad });
+        await worker.context.handleRequest(fetchEvent(formRequest('email=a%40x.com&x=1')));
+        const lines = (name) => worker.logs.filter((line) => line.startsWith(`Ignoring ${name}`));
+        assert.strictEqual(lines('VALID_STATUS').length, 1, JSON.stringify(bad));
+        assert.strictEqual(lines('BYPASS_PATH').length, 1, JSON.stringify(bad));
+        assert.strictEqual(await worker.calls.forwarded[0].text(), 'email=a%40x.com&x=1');
+    }
+});
+
+test('Low: API_TIMEOUT accepts whole milliseconds from 1 to 600000 and logs and replaces everything else', async () => {
+    const accepted = [[1, 1], [5000, 5000], ['5000', 5000], [' 250 ', 250], [600000, 600000], ['600000', 600000]];
+    for (const [value, expected] of accepted) {
+        const seen = [];
+        const { context, logs } = loadWorker({ API_KEY, API_TIMEOUT: value, AbortSignal: recordingAbortSignal(seen) });
+        await context.validateEmail('test@example.com', null);
+        assert.deepStrictEqual(seen, [expected], String(value));
+        assert.ok(!logs.some((line) => line.includes('Invalid API_TIMEOUT')), String(value));
+    }
+
+    for (const value of ['', ' ', 0, '0', -1, 1.5, '1.5', 600001, 1e12, '1e3', '0x10', Infinity, NaN, 'soon', true, {}, []]) {
+        const seen = [];
+        const { context, logs } = loadWorker({ API_KEY, API_TIMEOUT: value, AbortSignal: recordingAbortSignal(seen) });
+        await context.validateEmail('test@example.com', null);
+        assert.deepStrictEqual(seen, [10000], `API_TIMEOUT=${JSON.stringify(value)}`);
+        assert.ok(logs.some((line) => line.includes('Invalid API_TIMEOUT')), `API_TIMEOUT=${String(value)}`);
+    }
+
+    // Not set, or null: the default, silently.
+    for (const bindings of [{ API_TIMEOUT: null }, {}]) {
+        const seen = [];
+        const { context, logs } = loadWorker({ API_KEY, AbortSignal: recordingAbortSignal(seen), ...bindings }, { unbind: bindings.API_TIMEOUT === undefined ? ['API_TIMEOUT'] : [] });
+        await context.validateEmail('test@example.com', null);
+        assert.deepStrictEqual(seen, [10000]);
+        assert.ok(!logs.some((line) => line.includes('Invalid API_TIMEOUT')));
+    }
+});
+
+test('Low: the KV key stays within 512 bytes of UTF-8, keeps its date prefix and never splits a code point', async () => {
+    const long = `${'a'.repeat(300)}@x.com`;
+    const cases = [
+        [long, `/${'p'.repeat(2000)}`],
+        ['a@x.com', `/${'\u{1F600}'.repeat(600)}`],
+        [`${'\u00e9'.repeat(200)}@x.com`.slice(0, 250), `/${'\u4e2d'.repeat(400)}`],
+        ['a@x.com', '/short'],
+    ];
+    for (const [email, path] of cases) {
+        const kv = recordingKv();
+        const worker = loadWorker({ API_KEY, LOGS: kv.LOGS });
+        worker.context.logValidation({ waitUntil: () => {} }, email, path, { status: 'valid' });
+        await Promise.resolve();
+        // Called through waitUntil in the handler; here call it with a spy that runs the promise.
+        const events = [];
+        worker.context.logValidation({ waitUntil: (p) => events.push(p) }, email, path, { status: 'valid' });
+        await Promise.all(events);
+
+        assert.strictEqual(kv.puts.length, 2);
+        for (const { key } of kv.puts) {
+            const bytes = new TextEncoder().encode(key);
+            assert.ok(bytes.length <= 512, `${bytes.length} bytes`);
+            assert.doesNotThrow(() => new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+            assert.match(key, /^\{\d{4}-\d{2}-\d{2}\}-\{/);
+            assert.match(key, /\}-\{\d\d:\d\d\}-\d\d\.\d{3}$/);
+        }
+    }
+    // A key that fits is unchanged.
+    const kv = recordingKv();
+    const worker = loadWorker({ API_KEY, LOGS: kv.LOGS });
+    const events = [];
+    worker.context.logValidation({ waitUntil: (p) => events.push(p) }, 'a@x.com', '/short', { status: 'valid' });
+    await Promise.all(events);
+    assert.match(kv.puts[0].key, /^\{\d{4}-\d{2}-\d{2}\}-\{a@x\.com\}-\{\/short\}-\{\d\d:\d\d\}-\d\d\.\d{3}$/);
+});
+
+test('Low: the KV value is one JSON object, for a result and for a failure alike', async () => {
+    const kv = recordingKv();
+    const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'], LOGS: kv.LOGS });
+    await worker.context.handleRequest(fetchEvent(formRequest('email=a%40x.com')));
+    assert.deepStrictEqual(JSON.parse(kv.puts[0].value), { address: 'test@example.com', status: 'valid' });
+
+    const failing = recordingKv();
+    const bad = loadWorker({ API_KEY: 'two words', VALID_STATUS: ['valid'], LOGS: failing.LOGS });
+    await bad.context.handleRequest(fetchEvent(formRequest('email=a%40x.com')));
+    const stored = JSON.parse(failing.puts[0].value);
+    assert.deepStrictEqual(Object.keys(stored), ['error', 'message']);
+    assert.strictEqual(stored.error, 'Invalid API_KEY');
+});
+
+// --- Transport survivors ------------------------------------------------------
+
+test('transport: the handler hands the KV write to event.waitUntil', async () => {
+    const kv = recordingKv();
+    const worker = loadWorker({ API_KEY, LOGS: kv.LOGS });
+    const waited = [];
+    const event = { request: formRequest('email=a%40x.com'), waitUntil: (p) => waited.push(p), passThroughOnException: () => {} };
+
+    await worker.context.handleRequest(event);
+    await Promise.all(waited);
+
+    assert.strictEqual(waited.length, 1);
+    assert.strictEqual(kv.puts.length, 1);
+});
+
+test('transport: an HTML answer is refused whatever the case of its content type', async () => {
+    for (const type of ['TEXT/HTML', 'Text/Html; charset=UTF-8']) {
+        const { context } = loadWorker({ API_KEY });
+        context.fetch = async () => new Response(JSON.stringify({ status: 'valid', address: 'a@x.com' }), { status: 200, headers: { 'content-type': type } });
+        const result = await context.validateEmail('a@x.com', null);
+        assert.strictEqual(typeof result, 'string', type);
+        assert.ok(JSON.parse(result).message.includes('HTML'));
+    }
+});
+
+test('transport: only POST is validated; PUT, PATCH, DELETE and HEAD forms are forwarded as they are', async () => {
+    for (const method of ['PUT', 'PATCH', 'DELETE']) {
+        const worker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: { address: 'a@x.com', status: 'invalid' } });
+        const request = new Request('https://example.com/subscribe', {
+            method,
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: 'email=a%40x.com',
+        });
+        await worker.context.handleRequest(fetchEvent(request));
+        assert.strictEqual(worker.calls.validation.length, 0, method);
+        assert.strictEqual(await worker.calls.forwarded[0].text(), 'email=a%40x.com', method);
+    }
+});
+
+/** A fake answer for statuses Response will not construct (below 200). */
+function fakeResponse(status, body = '{}', type = 'application/json') {
+    return {
+        status,
+        headers: new Headers({ 'content-type': type }),
+        text: async () => body,
+        arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+    };
+}
+
+test('transport: every 3xx answer fails open without being followed or read', async () => {
+    for (const status of [300, 301, 302, 303, 304, 307, 308, 399]) {
+        const { context, errors } = loadWorker({ API_KEY });
+        context.fetch = async () => fakeResponse(status, JSON.stringify({ status: 'valid', address: 'a@x.com' }));
+        const result = JSON.parse(await context.validateEmail('a@x.com', null));
+        assert.strictEqual(result.error, 'Redirect', String(status));
+        assert.ok(errors.some((line) => line.includes(`HTTP ${status}`)), String(status));
+    }
+});
+
+test('transport: answers outside 2xx, 199 and 400 included, are failures even with a result-shaped body', async () => {
+    for (const status of [100, 199, 400, 404, 599]) {
+        const { context } = loadWorker({ API_KEY });
+        context.fetch = async () => fakeResponse(status, JSON.stringify({ status: 'valid', address: 'a@x.com' }));
+        const result = await context.validateEmail('a@x.com', null);
+        assert.strictEqual(typeof result, 'string', String(status));
+        assert.strictEqual(JSON.parse(result).error, `HTTP ${status}`);
+    }
+    for (const status of [200, 204, 299]) {
+        const { context } = loadWorker({ API_KEY });
+        context.fetch = async () => fakeResponse(status, JSON.stringify({ status: 'valid', address: 'a@x.com' }));
+        assert.strictEqual((await context.validateEmail('a@x.com', null)).status, 'valid', String(status));
+    }
+});
+
+test('transport: a null API_REGION uses the global host without logging', async () => {
+    const { context, calls, logs } = loadWorker({ API_KEY, API_REGION: null });
+    await context.validateEmail('a@x.com', null);
+    assert.strictEqual(calls.validation[0].url.origin, 'https://api.zerobounce.net');
+    assert.ok(!logs.some((line) => line.includes('API_REGION')));
 });

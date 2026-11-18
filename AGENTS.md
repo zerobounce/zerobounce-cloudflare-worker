@@ -19,7 +19,10 @@ why configuration arrives as bare globals rather than an `env` argument, and why
 - `cloudflare-worker-zerobounce.js`: the whole Worker.
 - `tests/worker.test.js`: the offline suite. It evaluates the Worker source in a fresh `node:vm` context per test, with
   a fake `fetch` and the bindings under test as context globals.
+- `tests/fixtures/`: a JSON test corpus (`strict-json-corpus.tsv`).
 - `.github/workflows/sdk_ci.yml`: parse check plus the test suite.
+- `.github/workflows/codeql.yml`: CodeQL code scanning.
+- `.github/dependabot.yml`: Dependabot security updates for the GitHub Actions pins.
 
 ## Commands
 
@@ -38,9 +41,9 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 | --- | --- |
 | `API_KEY` | ZeroBounce API key, an encrypted secret. Without it no validation happens. |
 | `API_REGION` | `us` or `usa`, `eu`, or unset / `global` / `default` for the global host. |
-| `API_TIMEOUT` | Milliseconds, passed to `AbortSignal.timeout`. Defaults to 10000 when unset or not a positive number. |
-| `VALID_STATUS` | Allow-list of ZeroBounce statuses. A status outside it is rewritten to `INVALID`. |
-| `BYPASS_PATH` | Paths that are forwarded untouched. |
+| `API_TIMEOUT` | Milliseconds, passed to `AbortSignal.timeout`. Defaults to 10000 when unset, empty, not a whole number, or outside 1 to 600000. |
+| `VALID_STATUS` | Allow-list of ZeroBounce statuses (JSON array; a plain string is one entry). A status outside it is rewritten to `INVALID`. |
+| `BYPASS_PATH` | Paths that are forwarded untouched (JSON array; a plain string is one entry). Exact match only. |
 | `LOGS` | KV namespace. When bound, each validation result is written to it. |
 
 ## Conventions
@@ -53,14 +56,14 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   never logged: `logValidation` records the *incoming* request's pathname, not the validation URL.
 - **There is no regional bulk or warm-up host.** `API_REGION` applies to `/v2/validate` only. `API_REGION` is matched
   against a fixed allow-list and an unrecognised value falls back to the global host, so a typo cannot redirect the key.
-- **The three regexes are deliberate and fragile.** They are flagged `DO NOT EDIT!` upstream, they are built from
-  strings (so every backslash is doubled), and the capture groups feed `$1INVALID` replacements. Do not "tidy" them.
+- **The regexes are deliberate and fragile.** They are flagged `DO NOT EDIT!` upstream and they are built from
+  strings (so every backslash is doubled). Do not "tidy" them.
 - **URL-encoded bodies are rewritten by byte span, never decoded and re-encoded as a whole.** `formFields` splits
   the raw body on `&` and decodes each field with `URLSearchParams` (which never throws on bad percent-encoding);
   `replaceFieldValues` swaps only the rejected value. Every other byte must reach the origin as sent.
 - **Multipart bodies are never decoded as a whole either.** `multipartAddress` splits the raw body on its boundary,
-  skips file parts, and runs the multipart regex over each remaining part as a one-character-per-byte string, so a
-  match's offsets are byte offsets; `replaceFieldValues` then swaps only the address. A UTF-8 decode and re-encode of
+  skips file parts, and reads the headers and value of each remaining part as a one-character-per-byte string, so
+  offsets are byte offsets; `replaceFieldValues` then swaps only the address. A UTF-8 decode and re-encode of
   the body would replace every non-UTF-8 byte of an uploaded file with U+FFFD.
 - **Content types are compared by media type** (`mediaType`: lower case, parameters dropped), never with `===` on the
   header or with `includes`.
@@ -71,7 +74,8 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   `event.passThroughOnException()` means a thrown error silently forwards to the origin. A change that can hang or
   throw before that point breaks the customer's form instead of their bad addresses.
 - **Fail open, but never silently.** A validation that yields no status (dead key, timeout, redirect, network error)
-  forwards the submission unvalidated and is logged with `console.error`. Never log a form body or the API key.
+  forwards the submission unvalidated and is logged with `console.error`. A missing or refused `API_KEY` and a 2xx
+  answer with an unknown status take the same path. Never log a form body or the API key.
 - **Match the surrounding style**: four-space indent, `console.log` for tracing, JSDoc blocks above each function. Do
   not reformat unrelated code and do not rewrite the Worker wholesale.
 
@@ -79,10 +83,6 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 
 Changing these would alter live behaviour, so they are documented rather than fixed. Raise them with a maintainer first.
 
-- In the JSON branch, `Object.keys(_form).filter(...)` returns an array, which is always truthy, so the matching `else`
-  branch is unreachable, and `_form[email_key]` only works while exactly one key starts with `email`.
-- The `[\\r\\n]+` alternative in the first regex matches the literal characters `\`, `r`, `n` rather than a newline.
-  The `\"\s+` alternative is what actually matches multipart bodies.
 - The Worker is MIT, stated both in the file header and in `LICENSE`, matching the 13 SDK repositories.
   The header previously said `GPL-2.0+`; that was reconciled to MIT by the maintainer, not assumed.
 
