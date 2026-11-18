@@ -3287,11 +3287,11 @@ test('round 5: an address of 255 to 320 characters is accepted, one of 321 is no
     for (const length of [254, 255, 300, 320]) {
         const address = make(length);
         assert.strictEqual(address.length, length);
-        const { calls } = await runHandler(formRequest(`email=${address.replace('@', '%40')}`), { status: 'valid' });
+        const { calls } = await runHandler(formRequest(`email=${encodeURIComponent(address)}`), { status: 'valid' });
         assert.deepStrictEqual(validated(calls), [address], String(length));
     }
     const long = make(321);
-    const refused = await runHandler(formRequest(`email=${long.replace('@', '%40')}`), { status: 'valid' });
+    const refused = await runHandler(formRequest(`email=${encodeURIComponent(long)}`), { status: 'valid' });
     assert.strictEqual(refused.calls.validation.length, 0);
     const { context } = loadWorker({ API_KEY });
     assert.strictEqual(context.isAddress(make(320)), true);
