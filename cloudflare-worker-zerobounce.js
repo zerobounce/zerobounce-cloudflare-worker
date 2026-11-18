@@ -331,14 +331,18 @@ const IDENTITY_ENCODINGS = ['7bit', '8bit', 'binary'];
  * A part is an email field (`email: true`) when its raw header block (every
  * header line up to the blank line, folded lines included) contains "email",
  * whatever the syntax of its Content-Disposition: the Worker does not try to
- * read names the way each origin does. A part whose Content-Disposition has a
- * filename or filename* parameter with an "=" (even `filename=""`) is a file
- * to PHP and undici: it is skipped, its bytes never read as an address and
- * never rewritten, whatever its headers or its filename say. A bare `filename`
- * with no "=" is a text field to PHP and is judged by its headers. The name is the parsed
- * Content-Disposition `name` (one that is exactly email, your-email or
- * your_email is preferred when a part repeats the header), or '' when none
- * parses. An email part with a transfer encoding other than 7bit, 8bit or
+ * read names the way each origin does.
+ *
+ * A part is a file only when its only Content-Disposition has a plain
+ * `filename=` parameter (even `filename=""`): it is skipped, its bytes never
+ * read as an address and never rewritten, whatever its other headers say.
+ * `filename*=`, `filename =` and a bare `filename` are text fields to PHP and
+ * are judged like any text field. Two Content-Disposition headers in one part
+ * are malformed. The name is the parsed Content-Disposition `name`, or ''
+ * when none parses. Bytes before the first delimiter are a preamble; one that
+ * contains `--boundary` anywhere (even after other bytes on a line) is malformed.
+ *
+ * An email part with a transfer encoding other than 7bit, 8bit or
  * binary (quoted-printable, base64) is `opaque`: its value is not what an
  * origin that decodes it would read, so it cannot be validated. No regular
  * expression runs over body bytes here, so the cost is linear.
@@ -371,6 +375,14 @@ function multipartFields(bytes, boundary) {
     const fields = [];
     fields.malformed = null;
     let closed = false;
+
+    // undici reads "--boundary" as a delimiter even after other bytes on a line,
+    // so a preamble (the bytes before the first delimiter line) that holds it
+    // anywhere is a body the two readers split differently.
+    if (indexOfBytes(bytes, dashes, 0, delimiter === -1 ? bytes.length : delimiter) !== -1) {
+        fields.malformed = 'the preamble contains the boundary';
+        return fields;
+    }
 
     while (delimiter !== -1) {
         const after = delimiter + dashes.length;
@@ -692,9 +704,11 @@ function logValidation(event, email, url, result) {
         // A failure is already JSON text ({"error": ..., "message": ...}), so it is
         // parsed and written once more through the redaction, never stored as a JSON
         // string of JSON.
-        const value = typeof result === 'string'
+        // The final text is redacted once more, so a member name (never reached
+        // by the value replacer) cannot carry the key into KV either.
+        const value = redactKey(typeof result === 'string'
             ? JSON.stringify(JSON.parse(result), redactString)
-            : JSON.stringify(result, redactString);
+            : JSON.stringify(result, redactString));
 
         // The waitUntil function allows us to continue performing work in our Cloudflare Worker, without blocking.
         // Every string is redacted before it is stored, so the API key never reaches KV.
@@ -1312,7 +1326,14 @@ async function validateEmail(email, ip_address) {
         // A body cut short throws here, as the transport error it is.
         // resp.text() would drop a leading byte order mark, which is not
         // JSON (RFC 8259), so the bytes are decoded with the mark kept.
-        const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(await resp.arrayBuffer());
+        const raw = await resp.arrayBuffer();
+        let text;
+        try {
+            text = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true }).decode(raw);
+        } catch (err) {
+            // Bytes that are not UTF-8 are not JSON (RFC 8259).
+            return validationFailure(`HTTP ${resp.status}`, 'ZeroBounce returned a response that is not JSON');
+        }
         if (jsonNestedTooDeep(text)) {
             // Storing or logging it would overflow the stack (JSON.stringify).
             return validationFailure(`HTTP ${resp.status}`, 'ZeroBounce returned a response nested too deeply to read');

@@ -66,12 +66,14 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
   One address is validated: first an email field named exactly `email`, `your-email` or `your_email`, then any email
   field, then (fallback) any field whose value is an address. Never send a value that is not an address. With
   `VALID_STATUS` set, every other email field that holds an address different from the validated one is rewritten to
-  `INVALID`, and a rejected status rewrites all of them. File parts are read only if their headers mention `email`.
+  `INVALID`, and a rejected status rewrites all of them. File parts are never read.
   Any email-field value that contains `@` and is not exactly the validated address is rewritten to `INVALID`, even if it
-  is not a plain address (and without an API call). Multipart `name*=` (RFC 2231) names are decoded. A file part is any
-  part with a `filename` parameter, even an empty one. The whole `Content-Type` picks the branch (multipart, then
+  is not a plain address (and without an API call). Multipart `name*=` (RFC 2231) names are decoded. A file part is a part
+  whose only `Content-Disposition` has a plain `filename=` parameter, even an empty one. `filename*=`, `filename =` and a
+  bare `filename` make a text part. Two `Content-Disposition` headers in one part are malformed (400). The whole `Content-Type` picks the branch (multipart, then
   URL-encoded, else JSON). An ambiguous `Content-Type`, or a `boundary` that is repeated, empty, over 70 characters or
-  has a non-RFC 2046 character (or a comma, unquoted), is answered with `400 Bad Request`, whatever the bindings.
+  has a non-RFC 2046 character (or a comma, unquoted), or a multipart body that is malformed (for example a preamble
+  that holds `--boundary`), is answered with `400 Bad Request`, whatever the bindings.
 - **Binding lists are forgiving.** `VALID_STATUS` and `BYPASS_PATH` are read as a JSON array of strings first. Otherwise
   the text loses every bracket and quote mark (straight and curly, because the live guide uses curly quotes) and is
   split on commas, semicolons, pipes and whitespace. Statuses that are not one of the seven API statuses are logged
@@ -99,7 +101,7 @@ All of them are optional, and the Worker degrades to a pass-through when one is 
 - **Fail open, but never silently.** A validation that yields no status (dead key, timeout, redirect, network error)
   forwards the submission unvalidated and is logged with `console.error`. A missing or refused `API_KEY` and a 2xx
   answer with an unknown status take the same path. Never log a form body or the API key.
-- **Match the surrounding style**: four-space indent, `console.log` for tracing, JSDoc blocks above each function. Do
+- **Match the surrounding style**: four-space indent, `logLine` and `errorLine` for tracing (they redact the key; never call `console.log` or `console.error` directly), JSDoc blocks above each function. Do
   not reformat unrelated code and do not rewrite the Worker wholesale.
 
 ## Known quirks (deliberately left alone)

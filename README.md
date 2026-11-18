@@ -25,15 +25,16 @@ says service workers are "deprecated, but still supported". This script does not
 
 Set these under **Workers & Pages → your Worker → Settings → Variables and Secrets**, or in `wrangler.toml`. Every
 binding is optional: when one is missing the Worker falls back to forwarding the request untouched. Two things do not
-depend on bindings. A request with an ambiguous `Content-Type` or boundary gets `400 Bad Request` (see below). And when
-`VALID_STATUS` is set, an email field whose value cannot be validated is still rewritten to `INVALID`, even with no
-`API_KEY`, because that rewrite needs no API call.
+depend on bindings. A request with an ambiguous `Content-Type` or boundary, or a malformed multipart body, gets
+`400 Bad Request` (see below). And when `VALID_STATUS` is set and no email field holds a plain address but one holds
+`@`, that field is rewritten to `INVALID` even with no `API_KEY`, because that rewrite needs no API call. With no
+`API_KEY`, every other request is forwarded unvalidated and untouched (fail open).
 
 | Binding | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `API_KEY` | Secret | — | Your ZeroBounce API key. Without it the Worker validates nothing. A key must be printable ASCII (U+0021–U+007E). A key that is empty, or has any character outside that range (whitespace, a control character, an invisible character such as a pasted trailing newline), is refused and logged, and nothing is validated. A missing key is handled the same way: it is logged and the request is forwarded. |
 | `API_REGION` | Variable | `global` | Which ZeroBounce host to validate against: `global` or `default`, `us` or `usa`, or `eu`. |
-| `API_TIMEOUT` | Variable | `10000` | Milliseconds before the validation request is aborted. Allowed range: 1 to 600000. A value that is empty, not a whole number, zero, negative or above 600000 is logged and replaced by the default. |
+| `API_TIMEOUT` | Variable | `10000` | Milliseconds before the validation request is aborted. Allowed range: 1 to 600000. A string must be plain digits (surrounding spaces are ignored). A value that is empty, not plain digits (`"1e4"`, `"5000.0"`, `"+5000"`), zero, negative or above 600000 is logged and replaced by the default. |
 | `VALID_STATUS` | Variable (JSON array) | — | Statuses you accept, e.g. `["valid","catch-all"]`. Statuses are compared without regard to case. Anything else is rewritten to `INVALID`. |
 | `BYPASS_PATH` | Variable (JSON array) | — | Paths to forward untouched, e.g. `["/wp-login.php"]`. A path must match exactly: list every path you want skipped. |
 | `LOGS` | KV namespace | — | When bound, every validation result is written to it. |
@@ -115,7 +116,9 @@ When `VALID_STATUS` is set it becomes `INVALID` (see below).
   become `INVALID`.
 - If the validation gives no status (fail open), or `VALID_STATUS` is not set, the body is not touched.
 
-So your origin never receives an unvalidated address in an email field. The trade-off: a form that has a second,
+When the Worker validates (`API_KEY` is bound and the API returns a status) and `VALID_STATUS` is set, your origin
+receives no unvalidated address in an email field. When there is no `API_KEY`, or validation fails open, the body is
+forwarded untouched, so every address in it is unvalidated. The trade-off: a form that has a second,
 different address field on purpose (a friend's email, a CC) gets that field rewritten to `INVALID`. Such a form should
 use `BYPASS_PATH`, or name that field without the word `email`.
 
@@ -139,6 +142,9 @@ malformed when:
   counts as malformed;
 - a part has headers but no blank line that ends them;
 - there is no closing delimiter `--boundary--`;
+- the bytes before the first delimiter (the preamble) contain `--boundary` anywhere, even after other text on the line
+  (`x--B`). undici reads that as a delimiter, so the Worker refuses it. A preamble without `--boundary`, such as
+  `This is a MIME message`, is allowed;
 - after the closing delimiter, the rest of the body holds `--boundary` again. Any other epilogue is allowed, such as the
   `--boundary--` plus line break that browsers send.
 
@@ -202,8 +208,8 @@ for data residency.
 The value is case-insensitive and surrounding whitespace is ignored. An unrecognised value falls back to the global
 host and logs a line, so a typo cannot send your API key somewhere unintended.
 
-Leaving `API_REGION` unset keeps the exact behaviour of earlier versions of this Worker, so existing deployments do not
-need any change.
+Leaving `API_REGION` unset uses the global host, as earlier versions did. Other behaviour has changed since then: see
+[Upgrading from earlier versions](#upgrading-from-earlier-versions).
 
 ZeroBounce documents no regional bulk or warm-up host, so this setting applies to the single-email `/v2/validate`
 endpoint only.
@@ -235,11 +241,18 @@ These behaviours changed since commit dfb439c. Check them before you update an e
 - **Ambiguous `Content-Type` or boundary** (see above) is answered with `400 Bad Request`. Before, it was forwarded.
   This happens even with no bindings.
 - **Unknown `VALID_STATUS` entries** are ignored and logged.
-- **`API_TIMEOUT`** must be 1 to 600000; other values are logged and replaced by the default.
+- **An empty `VALID_STATUS`** (`[]` or `""`) counts as not set, so nothing is rewritten. Before, it rewrote every
+  address.
+- **Quote marks, brackets and backticks in `BYPASS_PATH`** are removed from every entry, so a path that contains one
+  (`/it's`) can no longer be listed. It is read as `/its`, and the real path is validated. Before, such a path could be
+  bypassed.
+- **`API_TIMEOUT`** must be 1 to 600000, as a number or a string of plain digits. Other values are logged and replaced by the
+  default of 10000. That includes `"1e4"`, `"5000.0"` and `"+5000"`, which are whole numbers but are refused now.
 - **`API_KEY`** must be printable ASCII (U+0021–U+007E).
 - **JSON branch.** Any key that contains `email` is an email field (before: any key that starts with `email`). When
   `VALID_STATUS` is set, an email key whose value is not a string is set to `"INVALID"`.
-- **Malformed multipart** (see above) is answered with `400 Bad Request`. Before, it was forwarded.
+- **Malformed multipart** (see above), including a preamble that holds `--boundary`, is answered with
+  `400 Bad Request`. Before, it was forwarded.
 - **A non-address `email` value** (`email=notanemail`) is no longer sent to the API. Before, the API answered `invalid`
   and the value became `INVALID`. Now it is forwarded as is and costs no credit, unless it holds `@`: then it becomes
   `INVALID` (see above).

@@ -64,7 +64,8 @@ function loadWorker(bindings = {}, { validationResponse = { address: 'test@examp
 
             calls.validation.push({ url: new URL(String(input)), init: init || {} });
 
-            return new Response(JSON.stringify(validationResponse), {
+            // A Uint8Array answers with those exact bytes (for a body that is not UTF-8).
+            return new Response(validationResponse instanceof Uint8Array ? validationResponse : JSON.stringify(validationResponse), {
                 headers: { 'content-type': 'application/json' },
             });
         },
@@ -2135,9 +2136,12 @@ test('R2 bypass: a delimiter line is the boundary and nothing else but blanks an
         assert.deepStrictEqual(validated(result.calls), ['g@ok.example'], JSON.stringify(variant));
     }
 
-    // A bare CR is not a line break.
+    // A bare CR is not a line break: no delimiter line exists, and the body is
+    // a preamble that holds the boundary, so it is refused.
     const cr = `--zb-b\r${field('email', 'g@ok.example')}\r\n--zb-b--\r\n`;
-    assert.strictEqual((await runHandler(mpRequest(cr), { status: 'valid' })).calls.validation.length, 0);
+    const crWorker = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    assert.strictEqual((await crWorker.context.handleRequest(fetchEvent(mpRequest(cr)))).status, 400);
+    assert.strictEqual(crWorker.calls.validation.length, 0);
 });
 
 test('strict multipart: the boundary again after the closing delimiter is answered 400', async () => {
@@ -2693,7 +2697,7 @@ test('R3: more than one "boundary" anywhere in the Content-Type is a 400; a boun
     }
 });
 
-test('R3: boundary="" is not a boundary, and a first line --BBx is not a delimiter for boundary BB', async () => {
+test('R3: boundary="" is not a boundary, and a first line --BBx (the boundary inside the preamble) is a 400', async () => {
     const body = mpAll('B', mpGood('B'));
     for (const type of ['multipart/form-data; boundary=""', 'multipart/form-data; boundary=']) {
         // An empty boundary is refused (400), not forwarded.
@@ -2703,10 +2707,14 @@ test('R3: boundary="" is not a boundary, and a first line --BBx is not a delimit
         assert.strictEqual(w.calls.validation.length, 0, type);
         assert.strictEqual(w.calls.forwarded.length, 0, type);
     }
-    // "--BBx" is not a delimiter for boundary "BB": the only email part is after a real one.
+    // "--BBx" is no delimiter line for boundary "BB", but undici reads "--BB" in
+    // it as one: the preamble holds the boundary, so the body is refused.
     const text = `--BBx${C}Content-Disposition: form-data; name="email"${C}${C}${EVIL}${C}--BB${C}Content-Disposition: form-data; name="email"${C}${C}${GOOD}${C}--BB--${C}`;
-    const w = await runHandler(multipartRequest(text, 'multipart/form-data; boundary=BB'), { status: 'valid' });
-    assert.deepStrictEqual(validated(w.calls), [GOOD]);
+    const w = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+    const refused = await w.context.handleRequest(fetchEvent(multipartRequest(text, 'multipart/form-data; boundary=BB')));
+    assert.strictEqual(refused.status, 400);
+    assert.strictEqual(w.calls.validation.length, 0);
+    assert.strictEqual(w.calls.forwarded.length, 0);
 });
 
 test('R3: junk after a closing quote in a header parameter does not hide the name', async () => {
@@ -2904,6 +2912,7 @@ test('R4-2: an ambiguous Content-Type is answered 400, with no API or origin cal
         'multipart/form-data, application/x-www-form-urlencoded',
         'application/x-www-form-urlencoded, multipart/form-data; boundary=zb-b',
         'multipart/form-data; boundary=zb-b; x=application/x-www-form-urlencoded',
+        'application/x-www-form-urlencoded; boundary=zb-b; x=multipart/form-data',
         'application/x-www-form-urlencoded, text/plain',
         'text/plain application/x-www-form-urlencoded',
         'text/plain; note="application/x-www-form-urlencoded"',
@@ -2911,7 +2920,10 @@ test('R4-2: an ambiguous Content-Type is answered 400, with no API or origin cal
     ];
     for (const type of types) {
         const w = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
-        const response = await w.context.handleRequest(fetchEvent(multipartRequest('email=a%40x.com', type)));
+        // A body that is well formed for the type (multipart for zb-b, else
+        // url-encoded), so only the Content-Type guard can produce the 400.
+        const body = type.includes('boundary=zb-b') ? mpBody(field('email', 'a@x.com')) : 'email=a%40x.com';
+        const response = await w.context.handleRequest(fetchEvent(multipartRequest(body, type)));
         assert.strictEqual(response.status, 400, type);
         assert.strictEqual(await response.text(), 'Bad Request');
         assert.strictEqual(w.calls.validation.length, 0, type);
@@ -2964,7 +2976,10 @@ test('R4-3: an empty, too long or non-bchar boundary is answered 400', async () 
     ];
     for (const parameter of bad) {
         const type = `multipart/form-data; ${parameter}`;
-        const { status, w } = await refusedWith400(type);
+        // The body is well formed for the boundary as written (quotes and
+        // backslash escapes undone), so only the boundary guard can refuse it.
+        const written = parameter.slice('boundary='.length).replace(/^"(.*)"$/s, '$1').replace(/\\(.)/g, '$1');
+        const { status, w } = await refusedWith400(type, rawMp(written, field('email', 'a@x.com')));
         assert.strictEqual(status, 400, type);
         assert.strictEqual(w.calls.validation.length, 0, type);
         assert.strictEqual(w.calls.forwarded.length, 0, type);
@@ -3304,4 +3319,83 @@ test('round 5: apiErrorText skips whitespace-only text under every key', async (
         assert.strictEqual(context.apiErrorText({ [key]: ' ', ...(key === 'detail' ? { message: 'later' } : { detail: 'later' }) }), 'later', key);
     }
     assert.strictEqual(context.apiErrorText({ message: ' ' }, 'custom'), 'custom');
+});
+
+
+// ---------------------------------------------------------------------------
+// Fix round 6: preamble, KV member names, non-UTF-8 answer
+// ---------------------------------------------------------------------------
+
+const PRE_EMAIL = 'Content-Disposition: form-data; name="email"\r\n\r\nevil@bad.example\r\n';
+const PRE_GOOD = '--B\r\nContent-Disposition: form-data; name="email"\r\n\r\ngood@ok.example\r\n--B--\r\n';
+
+test('R6: a preamble that holds the boundary anywhere is answered 400, with no API or origin call', async () => {
+    const bodies = {
+        'x--B': `x--B\r\n${PRE_EMAIL}${PRE_GOOD}`,
+        'space --B': ` --B\r\n${PRE_EMAIL}${PRE_GOOD}`,
+        'CR --B': `\r--B\r\n${PRE_EMAIL}${PRE_GOOD}`,
+        '--B--B': `--B--B\r\n${PRE_EMAIL}${PRE_GOOD}`,
+        '--B x': `--B x\r\n${PRE_EMAIL}${PRE_GOOD}`,
+        'preamble-only email part': `x--B\r\n${PRE_EMAIL}--B--\r\n`,
+        'no delimiter line at all': `--B\r${PRE_EMAIL}`,
+    };
+    for (const [name, body] of Object.entries(bodies)) {
+        const w = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
+        const response = await w.context.handleRequest(fetchEvent(multipartRequest(body, 'multipart/form-data; boundary=B')));
+        assert.strictEqual(response.status, 400, name);
+        assert.strictEqual(w.calls.validation.length, 0, name);
+        assert.strictEqual(w.calls.forwarded.length, 0, name);
+    }
+});
+
+test('R6: a plain-text preamble (even one mentioning dashes) is still validated and the part rewritten', async () => {
+    for (const preamble of ['This is a MIME message\r\n', 'a -B b\r\n', '-- B\r\n', '']) {
+        const body = `${preamble}${PRE_GOOD}`;
+        const { calls, text } = await runHandler(multipartRequest(body, 'multipart/form-data; boundary=B'), { status: 'invalid' });
+        assert.strictEqual(calls.validation.length, 1, JSON.stringify(preamble));
+        assert.strictEqual(text, body.replace('good@ok.example', 'INVALID'), JSON.stringify(preamble));
+    }
+});
+
+test('R6: the preamble check is linear (1 MiB of dashes and CR before the first delimiter)', async () => {
+    for (const filler of ['-', '\r', '-\n', '--A']) {
+        const body = `${filler.repeat(Math.ceil(1048576 / filler.length))}\r\n${PRE_GOOD}`;
+        const started = Date.now();
+        await runHandler(multipartRequest(body, 'multipart/form-data; boundary=B'), { status: 'invalid' }).catch(() => {});
+        assert.ok(Date.now() - started < 3000, JSON.stringify(filler));
+    }
+});
+
+test('R6: the key never reaches KV as a member name, nested, URL-encoded or \\u-escaped', async () => {
+    const K = 'zb-dummy-key-0001';
+    const bodies = {
+        member: { address: 'a@b.co', status: 'valid', [K]: 1 },
+        nested: { address: 'a@b.co', status: 'valid', x: { ['pre' + K]: {} } },
+        encoded: { address: 'a@b.co', status: 'valid', [encodeURIComponent(K)]: 1 },
+        escaped: '{"address":"a@b.co","status":"valid","zb-dummy-key-\\u0030001":1}',
+        value: { address: 'a@b.co', status: 'valid', sub_status: K },
+    };
+    for (const [name, answer] of Object.entries(bodies)) {
+        const kv = recordingKv();
+        const w = loadWorker({ API_KEY: K, VALID_STATUS: ['valid'], LOGS: kv.LOGS }, {
+            validationResponse: typeof answer === 'string' ? new TextEncoder().encode(answer) : answer,
+        });
+        await w.context.handleRequest(fetchEvent(formRequest('email=a%40b.co')));
+        await new Promise((resolve) => setImmediate(resolve));
+        const stored = kv.puts.map((put) => put.key + '\n' + put.value).join('\n');
+        assert.ok(kv.puts.length > 0, name);
+        assert.ok(!stored.includes(K) && !stored.includes('0001'), `${name}: ${stored}`);
+        assert.ok(![...w.logs, ...w.errors].join('\n').includes(K), name);
+    }
+});
+
+test('E7: a 2xx answer that is not valid UTF-8 is not JSON and fails open', async () => {
+    const bytes = new Uint8Array([...new TextEncoder().encode('{"address":"a@b.co","status":"valid","note":"x'), 0xff, ...new TextEncoder().encode('"}')]);
+    const w = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: bytes });
+    const result = JSON.parse(await w.context.validateEmail('a@b.co', '198.51.100.7'));
+    assert.strictEqual(result.message, 'ZeroBounce returned a response that is not JSON');
+    // Through the handler the address is forwarded untouched, as for other non-JSON answers.
+    const handler = loadWorker({ API_KEY, VALID_STATUS: ['valid'] }, { validationResponse: bytes });
+    await handler.context.handleRequest(fetchEvent(formRequest('email=a%40b.co')));
+    assert.strictEqual(new TextDecoder().decode(new Uint8Array(await handler.calls.forwarded[0].arrayBuffer())), 'email=a%40b.co');
 });
