@@ -3338,6 +3338,8 @@ test('R6: a preamble that holds the boundary anywhere is answered 400, with no A
         '--B x': `--B x\r\n${PRE_EMAIL}${PRE_GOOD}`,
         'preamble-only email part': `x--B\r\n${PRE_EMAIL}--B--\r\n`,
         'no delimiter line at all': `--B\r${PRE_EMAIL}`,
+        'boundary on a later preamble line': `ok\r\nx--B\r\n${PRE_EMAIL}${PRE_GOOD}`,
+        'boundary on a later LF preamble line': `line one\nline two x--B\n${PRE_EMAIL}${PRE_GOOD}`,
     };
     for (const [name, body] of Object.entries(bodies)) {
         const w = loadWorker({ API_KEY, VALID_STATUS: ['valid'] });
@@ -3345,6 +3347,20 @@ test('R6: a preamble that holds the boundary anywhere is answered 400, with no A
         assert.strictEqual(response.status, 400, name);
         assert.strictEqual(w.calls.validation.length, 0, name);
         assert.strictEqual(w.calls.forwarded.length, 0, name);
+    }
+});
+
+test('R6: a KV record whose member name holds an encoded key is still stored as JSON', async () => {
+    const key = 'zb-dummy-key-0001';
+    for (const name of [key.replace('0001', '%30001'), key.replace('0001', '&#48;001'), key.toUpperCase()]) {
+        const stored = [];
+        const w = loadWorker({ API_KEY: key, VALID_STATUS: ['valid'], LOGS: { put: (k, v) => { stored.push(v); return Promise.resolve(); } } },
+            { validationResponse: { address: 'a@b.co', status: 'valid', [name]: 1 } });
+        await w.context.handleRequest(fetchEvent(formRequest('email=a%40b.co')));
+        assert.strictEqual(stored.length, 1, name);
+        const value = JSON.parse(stored[0]);
+        assert.ok(value && typeof value === 'object', name);
+        assert.ok(!stored[0].toLowerCase().includes('0001') || !stored[0].toLowerCase().includes('dummy-key'), name);
     }
 });
 

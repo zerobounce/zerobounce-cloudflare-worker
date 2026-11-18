@@ -706,9 +706,18 @@ function logValidation(event, email, url, result) {
         // string of JSON.
         // The final text is redacted once more, so a member name (never reached
         // by the value replacer) cannot carry the key into KV either.
-        const value = redactKey(typeof result === 'string'
+        // When the key turns up in a member name, redactKey can replace the whole
+        // text with a fixed message: that is stored as a failure record, so every
+        // KV value stays one JSON object.
+        const masked = redactKey(typeof result === 'string'
             ? JSON.stringify(JSON.parse(result), redactString)
             : JSON.stringify(result, redactString));
+        let value = masked;
+        try {
+            JSON.parse(masked);
+        } catch (err) {
+            value = JSON.stringify({ error: 'Redacted', message: masked });
+        }
 
         // The waitUntil function allows us to continue performing work in our Cloudflare Worker, without blocking.
         // Every string is redacted before it is stored, so the API key never reaches KV.
